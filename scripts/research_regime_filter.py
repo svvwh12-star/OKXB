@@ -41,8 +41,9 @@ def main() -> None:
         raise SystemExit("not enough intraday instruments")
 
     # --- BTC daily regime series ---
-    btc_d = cd.fetch_universe(["BTC-USDT-SWAP"], "1D", 365 * 3, DAILY / "candles")["BTC-USDT-SWAP"].sort_values("ts")
-    dvol = dd.fetch_dvol("BTC", 365 * 3)                         # df(ts, dvol)
+    btc_d = (cd.fetch_universe(["BTC-USDT-SWAP"], "1D", 365 * 3, DAILY / "candles")["BTC-USDT-SWAP"]
+             .drop_duplicates("ts").sort_values("ts"))
+    dvol = dd.fetch_dvol("BTC", 365 * 3).drop_duplicates("ts")   # df(ts, dvol)
     fund = cd.fetch_funding_series("BTC-USDT-SWAP", days).rename(columns={"funding": "value"})
     c = pd.Series(btc_d["c"].to_numpy(float), index=btc_d["ts"].to_numpy(np.int64))
     rv = (np.log(c).diff().rolling(10).std() * np.sqrt(365.0) * 100.0)
