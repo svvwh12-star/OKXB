@@ -1,0 +1,278 @@
+# ============================================================
+#  OKXB 默认配置  (来源: 用户策略方案 §17, 增补数据/费率/路径)
+#  标注 [VERIFY] 的值需由后台调研结果核验后再定稿。
+#  所有 *_pct 为百分比小数前的"百分数值": 0.20 表示 0.20% = 0.002。
+# ============================================================
+
+account:
+  initial_equity_usdt: 1000
+  total_drawdown_hard_stop_pct: 5.0      # -> -50 USDT 硬停
+  daily_loss_stop_usdt: 15
+  strategy_loss_stop_usdt: 8
+  symbol_loss_stop_usdt: 5
+  max_consecutive_losses: 4
+  max_concurrent_positions: 2
+  max_concurrent_stock_perp: 1
+  max_concurrent_crypto_perp: 2
+  no_auto_recover_after_killswitch: true  # 熔断后当日不自动恢复
+
+permissions:
+  allow_read: true
+  allow_trade: true
+  allow_withdraw: false                   # 必须为 false
+  ip_whitelist_required: true             # 实盘密钥必须绑 IP
+
+exchange:
+  # 区域路由 (已核验): 账户所属地区决定 base URL, 用错会鉴权/路由失败。
+  # global -> www.okx.com | us -> us.okx.com | eea -> eea.okx.com
+  # 由 .env 的 OKX_REGION 覆盖; 这里是默认值。
+  region: global
+  rest_hosts:
+    global: https://www.okx.com
+    us: https://us.okx.com
+    eea: https://eea.okx.com
+  ws_public:
+    live: wss://ws.okx.com:8443/ws/v5/public
+    demo: wss://wspap.okx.com:8443/ws/v5/public
+  ws_private:
+    live: wss://ws.okx.com:8443/ws/v5/private
+    demo: wss://wspap.okx.com:8443/ws/v5/private
+  ws_business:
+    live: wss://ws.okx.com:8443/ws/v5/business
+    demo: wss://wspap.okx.com:8443/ws/v5/business
+  ws_limits:
+    new_conns_per_sec_per_ip: 3
+    sub_ops_per_hour_per_conn: 480
+    keepalive_seconds: 20                 # <30s 发 'ping' 等 'pong'
+
+# 股票永续运行时资格门控: 公共 ticker 列表不代表你的账户能交易。
+# 必须登录后核验; 不可交易则该模块整体禁用 (fail-closed)。禁止 VPN 绕过。
+stock_perp_gate:
+  require_runtime_eligibility_check: true
+  disable_module_if_ineligible: true
+
+position_mode:
+  default: net                            # net / long_short
+  margin_mode: isolated                   # 逐仓, 限制单标的爆仓传染
+
+leverage:
+  crypto_major_default: 10
+  crypto_major_max: 20
+  crypto_alt_default: 5
+  crypto_alt_max: 10
+  stock_perp_default: 3
+  stock_perp_max: 5                       # [VERIFY] 以交易所 instrument 实际上限为准
+  use_exchange_instrument_limit: true     # 始终不写死, 动态读 instruments
+  # AI/手动『最佳杠杆』计算: 逐仓下若止损, 亏损≈保证金的此比例; 最佳杠杆 = 该值 / 止损% (钳[3,50]且<=交易所上限)
+  # 越小越保守(波动大→杠杆自动更低)。0.08 = 单次止损约亏 8% 保证金。
+  target_margin_risk_per_stop: 0.08
+
+universe:
+  # auto = 按流动性自动选(推荐: 标的越多超短线机会越多, 但只纳入活跃的);
+  # fixed = 用下面 *_priority 固定列表
+  mode: auto
+  max_crypto: 60                          # 加密永续按24h成交额取前N (已调大; 想更多继续加)
+  max_stock_perp: 25                      # 股票永续最多N个 (当前OKX约21个)
+  min_crypto_quote_vol_usd: 8000000       # 加密最低24h报价额(800万U), 过滤低流动山寨
+  min_stock_quote_vol_usd: 0              # 股票永续量本就低, 不卡(由盘口准入门控过滤)
+  # 股票永续识别表 (OKX无专门字段; 命中且 live 者纳入; 未上线的忽略)
+  stock_symbols: [SPY, QQQ, AAPL, MSFT, NVDA, TSLA, META, GOOGL, AMZN, GOOG, NFLX,
+                  AMD, INTC, AVGO, COIN, MSTR, PLTR, ORCL, MU, QCOM, ARM, ADBE,
+                  CRM, SMCI, UBER, ABNB, SHOP, DIS, BA, JPM, V, MA, WMT, PYPL]
+  # fixed 模式用的固定列表 (mode=fixed 时生效)
+  crypto_priority: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
+  stock_perp_priority: [SPY-USDT-SWAP, QQQ-USDT-SWAP, NVDA-USDT-SWAP, TSLA-USDT-SWAP]
+  # 准入评分: 每 60s 重评, < 阈值则即使信号强也不交易
+  tradability:
+    min_score: 75
+    max_spread_vs_median: 1.5
+    min_depth_vs_order_notional: 8
+    max_data_age_ms: 500
+
+risk:
+  risk_per_trade_usdt_default: 2.0
+  risk_per_trade_usdt_strong_signal: 2.5
+  risk_per_trade_usdt_taker: 1.5
+  max_total_notional_normal: 2500
+  max_total_notional_high_vol: 1500
+  max_total_notional_after_losses: 800
+  max_stock_perp_weekend_notional: 250
+  max_single_symbol_notional:
+    btc_eth: 800
+    sol: 600
+    spy_qqq: 600
+    aapl_msft: 700
+    nvda_tsla: 600
+  drawdown_ladder:                        # 日内 / 总回撤分级动作 (USDT, 负值)
+    daily_reduce_50_at: -8
+    daily_strong_only_at: -12
+    daily_halt_at: -15
+    total_halve_at: -30
+    total_reduce_only_at: -40
+    total_killswitch_at: -50
+
+signal:
+  # 入场 = 方向分>=门槛(主) + 可交易性>=门槛 + 1个确认(流向/趋势一致>=confirm_min) + 连续persist_ticks拍 + 冷却 + 净edge。
+  # 对称尺度(Stage A'): 多分=50×(1+方向), 空分=100−多分。50=中性、>50偏多、<50偏空、多+空恒=100。
+  # 可交易性[0,1]已与方向分【解耦】(独立门槛 min_tradability), 不再乘进分数(否则正常行情也被压到个位数)。
+  min_composite_score: 66                 # 入场门槛 (66≈方向0.32; 65–70 为合理起点; 务必用『信号检验/校准』按数据重定)
+  strong_composite_score: 74              # 强信号(放大仓位/允许taker; 74≈方向0.48)
+  min_tradability: 0.50                   # 可交易性独立门槛: 正常行情≈1, 仅价差过宽/深度过薄/波动死或过烈才<此值 (入场用raw与EMA较小者=快下慢上)
+  max_entry_spread_bps: 50                 # 绝对价差硬门(bps): 价差超此直接不开新仓 (软可做分之外的硬风控)
+  confirm_min: 0.20                       # 单一确认: 0.5*多空向flow + 0.5*多空向trend 的下限
+  persist_ticks: 3                        # 入场需连续满足的拍数 (500ms/拍 -> 1.5s), 去抖
+  cooldown_seconds: 20                    # 同标的两次开/平之间的冷却, 防反复进出
+  min_model_probability: 0.58             # (不再作硬门槛; 仅保留供参考)
+  strong_model_probability: 0.62
+  min_edge_to_cost_ratio: 1.0             # 期望净edge/成本 门槛【现为真过滤器】: 期望幅度=k×方向强度×持有期波动−成本 (由校准重定)
+  strong_edge_to_cost_ratio: 3.0
+  edge_move_k: 1.5                        # 期望幅度系数(暂用启发式; Stage B 用拟合 E[扣费后净收益] 替换 k)
+  edge_horizon_s: 30                      # 估期望幅度用的持有期(秒): 持有期波动 = rv×√(此值/0.5)
+  tp_rr: 1.6                              # 止盈盈亏比 tp=tp_rr*SL (由『策略校准』回测后写入)
+  sl_min_cost_mult: 2.5                   # 止损下限=往返成本×此值, 防止亚成本止损被噪声秒扫(白交手续费)
+  # ---- 出场 (连贯且防空转) ----
+  min_hold_seconds: 20                    # 此前不允许信号驱动平仓(止损/超时除外)
+  reversal_hyst_gap: 8                    # 反向平仓门槛 = 入场门槛 − 此值 (对称尺度: 进66 → 反向分到58才平)
+  decay_threshold: 54                     # 自身综合分(对称尺度,50中性)跌回此值附近=edge衰减, 择机平仓
+  trail_arm_pct: 0.0015                   # 顺向盈利达0.15%后启动移动止盈
+  trail_dist_frac_of_sl: 0.5             # 移动止盈回撤距离 = 止损距离 * 此比例 (锁利, 在SL内侧)
+  exit_cost_mult: 1.0                     # 信号驱动平仓的扣费保护: 避免亏损/锁利须 >= 1.0x往返成本
+  # ---- 信号去噪 (修复分数每0.5秒在20-80狂跳, 无法短线) ----
+  ema_flow_half_life_s: 1.0               # 流向分量EMA半衰期(秒); 0=不平滑
+  ema_trend_half_life_s: 2.0             # 趋势分量EMA半衰期
+  ema_score_half_life_s: 0.5            # 入场分再做一层轻EMA
+  ema_trad_half_life_s: 1.5             # 可交易性EMA半衰期(秒): 去除每拍价差/深度抖动, 让"可做"稳定
+  # 因子 z-score 绝对离散度地板: 淡市里 MAD 极小会把微小变化放大成大z(clamp4→tanh2≈0.96假满信号)
+  obi_sd_floor: 0.05                    # OBI∈[-1,1]: 需≥~5%绝对失衡才算强(防淡市OBI假强)
+  ofi_sd_floor: 0.0                     # OFI深度归一无固定量纲→默认0(不变), 待Stage B按录制的of分布校准
+  basis_sd_floor: 0.0                   # 股票basis, 默认0, 待校准
+  ti_notional_floor: 0.0               # 成交失衡按名义额收缩的地板(0=不变); >0防薄量单笔把TI钉死±1, 待Stage B按标的校准
+  dir_hyst_enter: 0.12                   # 方向闩锁: 合成方向超过此才认方向
+  dir_hyst_exit: 0.04                   # 跌破此才松手(中间死区, 防贴0来回翻)
+  persist_miss_grace: 1                  # 容忍连续坏拍数不清零持续计数
+  regime_rv_lo: 5.0e-5                   # 死盘=真冻结(0.5s步波动极低)才不做; 原2.0e-4过高→几乎全标的误判死盘从不交易。"行情太淡"改由期望edge门管(经济正确)
+  regime_rv_hi: 1.2e-3                   # 高于此=剧烈行情, 多平滑+多等几拍
+  regime_hv_alpha_scale: 0.6            # 剧烈行情EMA系数缩放(更平滑)
+  regime_persist_bonus: 1               # 剧烈行情额外要求的持续拍数
+  # 因子按"信息正交性"分组, 避免相关因子(OBI/OFI/TradeImb)虚高置信
+  weights:                                # 合计 100
+    microstructure: 20                    # OBI/OFI/TradeImbalance 组内再归一
+    order_flow: 15
+    trend: 15
+    volatility_regime: 10
+    basis_reference: 10
+    liquidity: 10
+    event_risk: 10
+    funding: 5
+    execution_quality: 5
+
+strategies:                               # 风险预算权重 (非资金比例)
+  hfm80_momentum_maker: 0.50
+  basis_meanrev: 0.20
+  hfr80_reversion: 0.15
+  breakout_taker: 0.10
+  ai_event_risk: 0.05                     # 不下单, 只否决/降仓
+
+execution:
+  default_entry_order: post_only_limit
+  taker_entry_allowed_only_if_strong_signal: true
+  use_market_order: false                 # 禁止无保护市价单
+  use_aggressive_limit_for_stop: true
+  reduce_only_on_exit: true
+  maker_order_ttl_ms_min: 700
+  maker_order_ttl_ms_max: 1500
+  basis_order_ttl_ms: 5000
+  reversion_order_ttl_ms: 1500
+  max_hold_seconds: 180                   # 持仓硬上限(秒), 超时止损平仓 (由『策略校准』写入)
+  prefer_ws_order_placement: true         # 下单走常驻已登录私有 WS, 仅延迟优势(限速桶与 REST 共享)
+  reprice_mode: amend                     # amend(低延迟,保队列,计入子账户1000/2s) / cancel_replace(撤单不计子账户上限)
+  rate_limit:                             # 已核验 (2026-06): 见 docs/RESEARCH_BRIEF.md §3
+    per_inst_place_per_2s: 60             # place/cancel/amend 各 60/2s, per (子账户,合约), 三者独立计数
+    per_inst_cancel_per_2s: 60
+    per_inst_amend_per_2s: 60
+    batch_per_2s: 300                     # 批量端点 300/2s, 每批 <=20 单
+    batch_max_orders: 20
+    subaccount_per_2s: 1000               # 子账户总量: 只算 新单+改单, 撤单不计入
+    instruments_per_2s: 20                # GET /public/instruments
+    safety_factor: 0.7                    # 只用额度的 70%, 留余量
+  cancel_all_after:                       # 死手开关: 崩溃/断线自动撤单 (最重要的无人值守安全机制)
+    enabled: true
+    timeout_seconds: 30                   # 须 >> 重武装周期(5s), 否则正常运行也会误撤(含手动挂单);
+                                          # 30s = 程序连续约6拍未重武装(真死/断线)才触发; 正常停止会先解除(=0)
+
+data:
+  # 已核验(2026-06): 免费散户栈如下; books-l2-tbt/books50-l2-tbt(10ms全深度)需 VIP4+, 不用。
+  # 订单簿完整性走 seqId/prevSeqId 连续性 (checksum 2026-06-23 起恒为0, 已废弃)。
+  channels:
+    bbo: bbo-tbt                          # L1 顶档, ~10ms (任意费率档可用, 仅需登录)
+    book: books5                          # 5 档快照, 100ms (无 checksum)
+    book_full: books                      # 400 档增量, ~100ms (首条全量, 之后增量, size=0 删档)
+    trades: trades                        # 逐笔主动方 -> 流向
+    funding: funding-rate
+    mark: mark-price                      # ~200ms
+    index: index-tickers                  # ~100ms
+  # 扫描订阅的频道: books5(5档快照,轻量)+trades 可扩展到几十~上百标的; BBO 由盘口派生。
+  # 若只盯少量主流且要极致新鲜, 可加 bbo-tbt: [bbo-tbt, books5, trades]
+  scan_channels: [books5, trades]
+  orderbook_integrity: seqid              # seqid (checksum 已废弃)
+  # 行情源: live=始终用实盘公共WS(全标的/~9ms, 推荐); demo=模拟盘WS(覆盖少/~260ms); auto=跟随交易模式
+  # 注: 公共行情免鉴权; 模拟盘只用于下单。实测 demo WS 缺 QQQ/AAPL/META 且延迟高, 故默认 live。
+  market_data_feed: live
+  staleness_ms: 500
+  ws_gap_seconds: 3
+
+fees:                                     # 已核验(2026-06, 标准非VIP); 实时以费率页 Futures>TradFi 为准
+  stock_perp_maker_pct: 0.02              # VIP3: 0.01
+  stock_perp_taker_pct: 0.05              # VIP3: 0.028
+  crypto_maker_pct: 0.02
+  crypto_taker_pct: 0.05
+  # 负费率返佣需高 VIP/高量, 1000U 账户够不到; 永续往返 ~0.04% 比现货 ~0.16% 便宜 4x
+
+weekend_stock_perp:
+  block_new_large_positions: true
+  max_notional_usdt: 250
+  close_before_us_close_friday_minutes: 30
+  allow_reduce_only: true
+  allow_small_high_confidence_trades: false
+
+event_risk:
+  earnings_block_before_minutes: 30
+  earnings_block_after_minutes: 90
+  sec_8k_high_severity_reduce_only_minutes: 60
+  social_media_single_source_trade_allowed: false
+  okx_contract_adjustment_close_only: true
+  poll_interval_seconds: 60               # AI 事件检查 1min~5min
+
+funding:
+  block_new_positions_before_funding_minutes: 10
+  max_funding_cost_share_of_expected_profit: 0.20
+
+kill_switch:
+  data_age_ms_max: 500
+  websocket_gap_seconds: 3
+  api_rejects_per_minute_max: 3
+  cancel_all_on_data_gap: true
+  close_only_on_api_error: true
+
+# 上线门槛 (回测/样本外, §15.4)
+go_live_gate:
+  min_oos_trades: 300
+  min_profit_factor: 1.25
+  min_win_rate_pct: 55
+  min_avg_rr: 0.8
+  max_drawdown_vs_expected_profit_pct: 50
+
+# 研究/校准: 每次运行(演练或实盘)逐拍录制到 recordings/calib_*.jsonl, 供『策略校准』回测。
+# 关闭录制把 record_enabled 设 false (不影响交易, 仅不再积累校准数据)。
+research:
+  record_enabled: true
+  calibrate:
+    min_trades: 25            # 一个配置至少要产生这么多笔交易才算有效样本
+    cost_haircut_mult: 1.0    # 成本放大系数(>1 更保守, 抵消回测对成交的乐观估计)
+    maker_fill: true          # 入场按 maker(中间价)成交假设; false=taker(吃价, 更保守)
+
+paths:
+  state_db: data/okxb_state.sqlite
+  recordings_dir: recordings
+  models_dir: models
+  logs_dir: logs

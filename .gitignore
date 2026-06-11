@@ -1,0 +1,46 @@
+# ============================================================
+#  CRITICAL: never commit secrets. .env holds API keys.
+# ============================================================
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+credentials*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Data / runtime artifacts (may be large or sensitive)
+data/
+recordings/
+*.sqlite
+*.db
+*.duckdb
+logs/
+*.log
+models/*.pkl
+models/*.txt
+models/*.bin
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
