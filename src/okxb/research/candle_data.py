@@ -233,6 +233,69 @@ def fetch_funding_mean(inst_id: str, days: float, *, host: Optional[str] = None,
     return float(df["funding"].mean()) if len(df) else None
 
 
+def parse_oi_rows(rows: list) -> pd.DataFrame:
+    """Parse OKX open-interest-history rows [ts, oi, oiCcy, oiUsd] -> ascending df(ts, oi, oi_usd)."""
+    out = []
+    for r in rows:
+        try:
+            out.append((int(r[0]), float(r[1]), float(r[3]) if len(r) > 3 else float("nan")))
+        except (TypeError, ValueError, IndexError):
+            continue
+    df = pd.DataFrame(sorted(set(out)), columns=["ts", "oi", "oi_usd"])
+    if len(df):
+        df["ts"] = df["ts"].astype("int64")
+    return df
+
+
+def fetch_oi_history(inst_id: str, period: str, days: float, *,
+                     host: Optional[str] = None, log: Callable[[str], None] = _log) -> pd.DataFrame:
+    """Open-interest history for a perp. period in OKX codes (e.g. '1H','1D'). Ascending df(ts, oi, oi_usd).
+
+    Endpoint: /api/v5/rubik/stat/contracts/open-interest-history (rows newest-first
+    [ts, oi(contracts), oiCcy(base), oiUsd]). Pages backward via `after`.
+    """
+    now_ms = int(time.time() * 1000)
+    start = now_ms - int(days * 86_400_000)
+    hosts = [host] if host else list(HOSTS)
+    url_path = "/api/v5/rubik/stat/contracts/open-interest-history"
+    rows: list = []
+    after: Optional[int] = None
+    last_oldest: Optional[int] = None
+    with httpx.Client(timeout=25.0, headers={"User-Agent": "okxb-research/1"}) as cli:
+        for _ in range(200):
+            data = None
+            for _attempt in range(3):                      # retry a page before giving up (transient net)
+                for h in hosts:
+                    try:
+                        params = {"instId": inst_id, "period": period, "limit": "100"}
+                        if after is not None:
+                            params["after"] = str(after)
+                        j = cli.get(h + url_path, params=params).json()
+                        if j.get("code") == "0":
+                            data = j.get("data", [])
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+                if data is not None:
+                    break
+                time.sleep(0.3)
+            if not data:
+                break
+            rows.extend(data)
+            oldest = min(int(x[0]) for x in data)
+            if oldest <= start or len(data) < 2:
+                break
+            # OKX rubik OI-history retains only the recent window and ignores `after`/`before`;
+            # if paging no longer reaches older data, stop instead of re-fetching the same page.
+            if last_oldest is not None and oldest >= last_oldest:
+                break
+            last_oldest = oldest
+            after = oldest
+            time.sleep(0.1)
+    df = parse_oi_rows(rows)
+    return df[df["ts"] >= start].reset_index(drop=True)
+
+
 def perp_to_spot(inst_id: str) -> str:
     """永续 instId → 现货 instId。BTC-USDT-SWAP → BTC-USDT。"""
     return inst_id[:-5] if inst_id.endswith("-SWAP") else inst_id
