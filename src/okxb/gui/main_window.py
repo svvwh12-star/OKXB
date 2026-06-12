@@ -1087,8 +1087,10 @@ class OKXBApp(ctk.CTk):
             return messagebox.askyesno("实盘真金确认", f"你正在【实盘】{action}, 会动用真金。确认?")
         return True
 
-    def _m_set(self, text: str) -> None:
+    def _m_set(self, text: str, clear: bool = False) -> None:
         self.m_result.configure(state="normal")
+        if clear:                       # 切换标的 / 新一次 AI 分析时清空, 只显示当前标的的内容
+            self.m_result.delete("1.0", "end")
         self.m_result.insert("end", text + "\n")
         self.m_result.see("end")
         self.m_result.configure(state="disabled")
@@ -1158,7 +1160,7 @@ class OKXBApp(ctk.CTk):
         """点持仓行: 把该标的带入左侧表单并刷新行情/历史。"""
         self.m_inst.delete(0, "end"); self.m_inst.insert(0, inst)
         self._refresh_orders()
-        self._m_set(f"已带入 {inst}: 可在左侧改杠杆/数量后『减仓/平该标的』, 或『挂止盈/止损』。")
+        self._m_set(f"已带入 {inst}: 可在左侧改杠杆/数量后『减仓/平该标的』, 或『挂止盈/止损』。", clear=True)
 
     def _m_bracket(self) -> None:
         if not self._m_confirm("套单(建仓+止盈+止损)"):
@@ -1185,13 +1187,13 @@ class OKXBApp(ctk.CTk):
             self._m_set("请先填标的。")
             return
         row = dict(self.ctrl.rows().get(inst, {}))
-        self._m_set(f"... AI 量化分析 {inst} 中 (用更强模型, 约数秒) ...")
+        self._m_set(f"... AI 量化分析 {inst} 中 (用更强模型, 约数秒) ...", clear=True)
 
         def work():
             res = ai_analyze_sync(inst, row)
 
             def done():
-                self._m_set(res.get("text", "(无输出)"))
+                self._m_set(res.get("text", "(无输出)"), clear=True)   # 只显示当前标的研判
                 self._ai_last = res.get("struct")
                 if self._ai_last:
                     self._ai_last.setdefault("inst", inst)
@@ -1237,7 +1239,7 @@ class OKXBApp(ctk.CTk):
         if d.get("mid"):
             self.m_px.delete(0, "end"); self.m_px.insert(0, str(d["mid"]))
         self._tabs.set("手动交易")
-        self._m_set(f"已带入 {inst} (方向按当前信号预选, 可改)。可点『AI分析』或直接『建仓/加仓』。")
+        self._m_set(f"已带入 {inst} (方向按当前信号预选, 可改)。可点『AI分析』或直接『建仓/加仓』。", clear=True)
 
     # ---- 实时面板: 行情 + 持仓 + 挂单 + 止盈止损 + 历史成交 ----
     def _refresh_orders(self) -> None:

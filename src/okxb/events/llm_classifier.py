@@ -236,7 +236,12 @@ class LLMClassifier:
         sysp = ("你是严谨的加密/美股永续合约短线量化分析师。只允许基于【给定的客观盘口与因子数据】"
                 "与【已算好的风险量】做判断, 严禁编造新闻、财报、社媒或任何外部消息。"
                 "杠杆必须在 [3, {lvmax}] 内且优先采用给定的『量化建议杠杆』, 仅在有明确理由时小幅调整。"
-                "止盈/止损/入场价应贴近给定的量化默认值。务必中文。"
+                "止盈/止损/入场价应贴近给定的量化默认值。"
+                "【铁律·挂单侧】若 order_type=post_only(挂单/maker), entry_px 必须落在 maker 侧: "
+                "做多(long)时 entry_px ≤ 中间价, 做空(short)时 entry_px ≥ 中间价; "
+                "否则会越过盘口被立即成交为 taker(做空给出低于现价的入场价是错误的)。"
+                "entry_px 偏离中间价不要超过 0.3%。若你想立即成交, 请把 order_type 改为 optimal_limit_ioc 并说明。"
+                "务必中文。"
                 ).format(lvmax=int(qctx.get("lev_max", 50)))
         schema = ('{"direction":"long|short|flat","order_type":"post_only|limit|optimal_limit_ioc",'
                   '"entry_px":number,"tp_px":number,"sl_px":number,"leverage":int,'
@@ -291,6 +296,21 @@ class LLMClassifier:
         for k in ("rationale", "risks", "scaling"):
             if isinstance(d.get(k), str):
                 out[k] = d[k][:200]
+        # 安全网: 强制 maker 侧。post_only 下若 AI 把入场价放错一侧(做空给≤现价、做多给≥现价),
+        # 就按所选方向用 mid+客观偏移重算 入场/止盈/止损, 保证逻辑上能挂单成交、盈亏比不变。
+        mid = qctx.get("mid")
+        dsign = 1 if out["direction"] == "long" else (-1 if out["direction"] == "short" else 0)
+        if mid and dsign and out["order_type"] == "post_only":
+            ep = out.get("entry_px")
+            wrong = ep is None or (dsign > 0 and ep > mid) or (dsign < 0 and ep < mid)
+            if wrong:
+                off = float(qctx.get("entry_off") or 0.0002)
+                sl_pct = float(qctx.get("sl_pct") or 0.0)
+                tp_pct = float(qctx.get("tp_pct") or 0.0)
+                entry = mid * (1 - dsign * off)
+                out["entry_px"] = round(entry, 6)
+                out["tp_px"] = round(entry * (1 + dsign * tp_pct), 6)
+                out["sl_px"] = round(entry * (1 - dsign * sl_pct), 6)
         return out
 
     async def pick_products(self, pool_label: str, candidates: list[dict],
@@ -328,10 +348,17 @@ class LLMClassifier:
         try:
             d = await self._chat_json(self._json_model(), sysp, user, max_tokens=1600)
             picks = d.get("picks") if isinstance(d.get("picks"), list) else []
+            valid_insts = {str(c.get("inst")) for c in candidates}   # 只认真实候选池
             clean = []
-            for p in picks[:5]:
+            dropped = []
+            for p in picks[:8]:
                 if not isinstance(p, dict) or not p.get("inst"):
                     continue
+                if str(p["inst"]) not in valid_insts:    # 拦截 AI 杜撰/写错的标的(如 BEAT-USDT-SWAP)
+                    dropped.append(str(p["inst"]))
+                    continue
+                if len(clean) >= 5:
+                    break
                 try:
                     lv = max(3, min(50, int(round(float(p.get("leverage", 5))))))
                 except (TypeError, ValueError):
@@ -345,7 +372,10 @@ class LLMClassifier:
                     "reason": str(p.get("reason", ""))[:120],
                     "risk": str(p.get("risk", ""))[:100],
                 })
-            return {"ok": True, "picks": clean, "text": _render_picks(pool_label, clean, d.get("note", ""))}
+            note = str(d.get("note", ""))
+            if dropped:      # 把被拦截的杜撰标的如实告知, 不静默丢弃
+                note = (note + f" (已忽略不在候选池中的杜撰标的: {', '.join(dropped[:5])})").strip()
+            return {"ok": True, "picks": clean, "text": _render_picks(pool_label, clean, note)}
         except Exception as e:
             return {"ok": False, "picks": [], "text": f"AI 选品失败: {e!r}"}
 
@@ -500,9 +530,12 @@ _OT_CN = {"post_only": "只挂单(maker)", "limit": "限价", "optimal_limit_ioc
 
 def _render_analysis(inst: str, s: dict, qctx: dict) -> str:
     d = s.get("direction", "flat")
+    mid = qctx.get("mid")
+    side_cn = "高于现价挂卖(等反抽)" if d == "short" else ("低于现价挂买(等回踩)" if d == "long" else "")
+    mid_cn = f" [现价≈{mid}{('; ' + side_cn) if side_cn else ''}]" if mid else ""
     lines = [f"【{inst}】AI 量化研判  (置信度 {s.get('confidence', 0):.0%})",
              f"方向: {_DIR_CN.get(d, d)}    下单类型: {_OT_CN.get(s.get('order_type'), s.get('order_type'))}",
-             f"入场价≈{s.get('entry_px')}   止盈≈{s.get('tp_px')}   止损≈{s.get('sl_px')}",
+             f"入场价≈{s.get('entry_px')}   止盈≈{s.get('tp_px')}   止损≈{s.get('sl_px')}{mid_cn}",
              f"建议杠杆: {s.get('leverage')}x (逐仓; 依据 ATR 推导的止损距离, "
              f"使止损亏损≈保证金的{int(qctx.get('target_risk', 0.1)*100)}%, 上限{qctx.get('lev_max')}x)",
              f"建议下单额: {s.get('size_usdt')} USDT (按单笔风险预算)",
@@ -510,6 +543,7 @@ def _render_analysis(inst: str, s: dict, qctx: dict) -> str:
              f"风险: {s.get('risks') or '-'}",
              f"建/减仓: {s.get('scaling') or '-'}",
              "—— 点『⬇ 导入手动交易』把以上参数填入下单区(不会自动下单, 你确认后再点下单)。",
+             "注: 入场价是【挂单(maker)参考】, 真正下单时会按当时盘口校正到正确一侧; 价已过期则被重排。",
              "仅供参考, 非投资建议。"]
     return "\n".join(lines)
 

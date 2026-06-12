@@ -795,18 +795,26 @@ async def _quant_context(inst_id: str, row: dict) -> dict:
     d = 1 if long_s >= short_s else -1
     dir_prior = "long" if d > 0 else "short"
     entry_px = mid
+    entry_off = 0.0
     tp_px = sl_px = None
     if mid:
         digits = 6 if mid < 1 else (4 if mid < 100 else 2)
-        tp_raw = mid * (1 + d * tp_pct)
-        sl_raw = mid * (1 - d * sl_pct)
+        # maker(post_only)入场价必须落在【正确一侧】: 做多挂买单须≤中间价, 做空挂卖单须≥中间价。
+        # 否则越过盘口被立即吃成 taker —— 这也是"做空却给出低于现价的入场价、看着不可能成交"的根因。
+        # 偏移取 max(半价差, ~1tick, 2bps), 让单子贴着盘口排队, 等回踩(多)/反抽(空)成交。
+        half_spread = (float(row.get("spread_bps") or 4.0) / 1e4) * 0.5
+        tick_frac = (float(tick) / mid) if tick else 0.0
+        entry_off = max(half_spread, tick_frac, 0.0002)
+        entry_raw = mid * (1 - d * entry_off)            # 多: 低于mid; 空: 高于mid
+        tp_raw = entry_raw * (1 + d * tp_pct)            # 止盈止损以【入场价】为基准, 保持盈亏比一致
+        sl_raw = entry_raw * (1 - d * sl_pct)
         # 对齐 tickSz (拿到规格时), 避免导入后下单报价格精度错
         if tick:
-            entry_px = float(_round_tick(mid, tick) or round(mid, digits))
+            entry_px = float(_round_tick(entry_raw, tick) or round(entry_raw, digits))
             tp_px = float(_round_tick(tp_raw, tick) or round(tp_raw, digits))
             sl_px = float(_round_tick(sl_raw, tick) or round(sl_raw, digits))
         else:
-            entry_px = round(mid, digits)
+            entry_px = round(entry_raw, digits)
             tp_px = round(tp_raw, digits)
             sl_px = round(sl_raw, digits)
     return {
@@ -815,7 +823,7 @@ async def _quant_context(inst_id: str, row: dict) -> dict:
         "trend_dir": row.get("trend_dir"), "flow_dir": row.get("flow_dir"),
         "long": long_s, "short": short_s, "atr": atr, "rvol": row.get("rvol"),
         "dir_prior": dir_prior, "sl_pct": round(sl_pct, 5), "tp_pct": round(tp_pct, 5),
-        "entry_px": entry_px, "tp_px": tp_px, "sl_px": sl_px,
+        "entry_px": entry_px, "tp_px": tp_px, "sl_px": sl_px, "entry_off": round(entry_off, 5),
         "lev_suggest": lv, "lev_max": int(lev_max), "size_usdt": size_usdt,
         "target_risk": target_risk, "cost_pct": round(cost, 5), "valid": valid,
     }
@@ -841,8 +849,10 @@ def stock_symbol_set() -> set:
 
 
 async def _okx_24h() -> dict:
-    """一次取回全市场 24h 行情 (真实权威交易所数据): inst -> {chg%, volU}。无需鉴权。"""
-    from ..exchange.okx_rest import OkxError, OkxRestClient
+    """一次取回全市场 24h 行情 (真实权威交易所数据): inst -> {chg%, volU}。无需鉴权。
+    注意: /market/tickers 是全市场(~500条)大响应, 区域受限网络上比单标的更易 ConnectError;
+    这里【宽松兜底】任何网络/解析异常都返回已拿到的部分, 绝不把整个 AI 选品搞挂(原 bug)。"""
+    from ..exchange.okx_rest import OkxRestClient
     rest = OkxRestClient(Secrets(), Config.load())
     out: dict[str, dict] = {}
     try:
@@ -852,8 +862,8 @@ async def _okx_24h() -> dict:
             chg = (last / op - 1.0) * 100.0 if op > 0 else 0.0
             out[t["instId"]] = {"chg": round(chg, 2),
                                 "volU": float(t.get("volCcy24h", 0) or 0)}
-    except OkxError:
-        pass
+    except Exception as e:        # OkxError + httpx.ConnectError/ReadTimeout 等一律兜底
+        print(f"[pick] 全市场24h行情获取失败({e!r}); 改用引擎实时信号/降级继续")
     finally:
         await rest.aclose()
     return out
@@ -901,6 +911,10 @@ async def _ai_pick(pool, rows) -> dict:
     cands.sort(key=lambda c: c["_opp"], reverse=True)
     pool_cn = {"crypto": "加密永续", "stock": "美股永续", "all": "全部永续"}.get(pool, pool)
     if not cands:
+        if not mkt and not rows:
+            return {"text": f"[{pool_cn}] 无法获取候选: 全市场24h行情拉取失败(网络/区域限制), "
+                            "且引擎未在跑。请①点『控制台』▶启动引擎用实时信号选品, 或②检查网络后重试。",
+                    "picks": []}
         return {"text": f"[{pool_cn}] 暂无实时候选。请先在『控制台』▶启动引擎, 待行情填充后再选品。",
                 "picks": []}
     brief = await _external_brief(pool, cands)        # Finnhub 真实新闻/财报 (有key才有)
