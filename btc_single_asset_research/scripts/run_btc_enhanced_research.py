@@ -29,6 +29,14 @@ REPORT_ROOT = OUT_ROOT / "reports"
 HOSTS = ["https://www.okx.com", "https://us.okx.com", "https://eea.okx.com"]
 DAY_MS = 86_400_000
 
+# Multi-asset: the pipeline was BTC-only. These maps let --asset=eth reuse the SAME feature
+# engineering on ETH data. Feature COLUMN names are kept shared across assets (so the forward
+# scorer needs no per-asset renames); only the rubik cache files + output files are separated.
+ASSETS = {
+    "btc": {"perp": "BTC-USDT-SWAP", "spot": "BTC-USDT", "ccy": "BTC", "deribit": "BTC", "cm": "btc"},
+    "eth": {"perp": "ETH-USDT-SWAP", "spot": "ETH-USDT", "ccy": "ETH", "deribit": "ETH", "cm": "eth"},
+}
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -89,10 +97,11 @@ def parse_rows(rows: list, cols: list[str]) -> pd.DataFrame:
     return df
 
 
-def fetch_rubik_once(name: str, path: str, params: dict, cols: list[str], *, force: bool) -> pd.DataFrame:
+def fetch_rubik_once(name: str, path: str, params: dict, cols: list[str], *, force: bool,
+                     cache_name: str | None = None) -> pd.DataFrame:
     d = DATA_ROOT / "okx_rubik"
     d.mkdir(parents=True, exist_ok=True)
-    f = d / f"{name}.csv"
+    f = d / f"{cache_name or name}.csv"
     cached = cache_read(f, force)
     if cached is not None and len(cached):
         return cached
@@ -132,7 +141,9 @@ def merge_on_ts(frames: list[pd.DataFrame]) -> pd.DataFrame:
     return out
 
 
-def fetch_daily_external(days: int, *, force: bool) -> tuple[pd.DataFrame, pd.DataFrame]:
+def fetch_daily_external(days: int, *, force: bool, asset: str = "btc") -> tuple[pd.DataFrame, pd.DataFrame]:
+    a = ASSETS[asset]
+    pref = "" if asset == "btc" else f"{asset}_"        # btc reuses existing unprefixed rubik cache
     frames: list[pd.DataFrame] = []
     inventory: list[dict] = []
 
@@ -140,31 +151,31 @@ def fetch_daily_external(days: int, *, force: bool) -> tuple[pd.DataFrame, pd.Da
         (
             "okx_oi_1d",
             "/api/v5/rubik/stat/contracts/open-interest-history",
-            {"instId": "BTC-USDT-SWAP", "period": "1D", "limit": "100"},
+            {"instId": a["perp"], "period": "1D", "limit": "100"},
             ["ts", "oi_contracts", "oi_btc", "oi_usd"],
         ),
         (
             "okx_oi_volume_1d",
             "/api/v5/rubik/stat/contracts/open-interest-volume",
-            {"ccy": "BTC", "period": "1D", "limit": "200"},
+            {"ccy": a["ccy"], "period": "1D", "limit": "200"},
             ["ts", "oi_volume_open", "oi_volume_turnover"],
         ),
         (
             "okx_taker_1d",
             "/api/v5/rubik/stat/taker-volume",
-            {"ccy": "BTC", "instType": "CONTRACTS", "period": "1D", "limit": "200"},
+            {"ccy": a["ccy"], "instType": "CONTRACTS", "period": "1D", "limit": "200"},
             ["ts", "taker_buy", "taker_sell"],
         ),
         (
             "okx_lsr_global_1d",
             "/api/v5/rubik/stat/contracts/long-short-account-ratio",
-            {"ccy": "BTC", "period": "1D", "limit": "200"},
+            {"ccy": a["ccy"], "period": "1D", "limit": "200"},
             ["ts", "lsr_global"],
         ),
         (
             "okx_lsr_contract_1d",
             "/api/v5/rubik/stat/contracts/long-short-account-ratio-contract",
-            {"instId": "BTC-USDT-SWAP", "period": "1D", "limit": "100"},
+            {"instId": a["perp"], "period": "1D", "limit": "100"},
             ["ts", "lsr_contract"],
         ),
     ]
@@ -172,7 +183,7 @@ def fetch_daily_external(days: int, *, force: bool) -> tuple[pd.DataFrame, pd.Da
     cutoff = int(time.time() * 1000) - int((days + 10) * DAY_MS)
     for name, path, params, cols in specs:
         try:
-            raw = fetch_rubik_once(name, path, params, cols, force=force)
+            raw = fetch_rubik_once(name, path, params, cols, force=force, cache_name=f"{pref}{name}")
             raw = raw[raw["ts"] >= cutoff].reset_index(drop=True)
             if name == "okx_taker_1d" and {"taker_buy", "taker_sell"}.issubset(raw.columns):
                 tot = raw["taker_buy"] + raw["taker_sell"]
@@ -188,7 +199,7 @@ def fetch_daily_external(days: int, *, force: bool) -> tuple[pd.DataFrame, pd.Da
             inventory.append({"source": name, "rows": 0, "error": f"{type(exc).__name__}: {exc}"})
 
     try:
-        dvol = deribit_data.fetch_dvol("BTC", days + 5, resolution="86400", log=log)
+        dvol = deribit_data.fetch_dvol(a["deribit"], days + 5, resolution="86400", log=log)
         dvol = dvol.rename(columns={"dvol": "dvol_daily"})
         dvol["dvol_daily_chg1"] = dvol["dvol_daily"].diff()
         dvol["dvol_daily_z20"] = rolling_z(dvol["dvol_daily"], 20)
@@ -198,7 +209,7 @@ def fetch_daily_external(days: int, *, force: bool) -> tuple[pd.DataFrame, pd.Da
         inventory.append({"source": "deribit_dvol_1d", "rows": 0, "error": f"{type(exc).__name__}: {exc}"})
 
     try:
-        onchain = onchain_data.fetch_onchain("btc", None, days + 10, DATA_ROOT / "coinmetrics", force=force, log=log)
+        onchain = onchain_data.fetch_onchain(a["cm"], None, days + 10, DATA_ROOT / "coinmetrics", force=force, log=log)
         cm_frames = []
         for metric, df in onchain.items():
             m = df.rename(columns={"value": f"cm_{metric}"})
@@ -217,44 +228,46 @@ def fetch_daily_external(days: int, *, force: bool) -> tuple[pd.DataFrame, pd.Da
     daily = merge_on_ts(frames)
     d = DATA_ROOT / "external"
     d.mkdir(parents=True, exist_ok=True)
-    daily.to_csv(d / "btc_daily_external_features.csv", index=False)
+    daily.to_csv(d / f"{asset}_daily_external_features.csv", index=False)
     inv = pd.DataFrame(inventory)
-    inv.to_csv(d / "source_inventory.csv", index=False)
+    inv.to_csv(d / f"{asset}_source_inventory.csv", index=False)
     return daily, inv
 
 
-def fetch_short_intraday_external(*, force: bool) -> tuple[pd.DataFrame, pd.DataFrame]:
+def fetch_short_intraday_external(*, force: bool, asset: str = "btc") -> tuple[pd.DataFrame, pd.DataFrame]:
+    a = ASSETS[asset]
+    pref = "" if asset == "btc" else f"{asset}_"
     frames: list[pd.DataFrame] = []
     inventory: list[dict] = []
     specs = [
         (
             "okx_oi_5m",
             "/api/v5/rubik/stat/contracts/open-interest-history",
-            {"instId": "BTC-USDT-SWAP", "period": "5m", "limit": "100"},
+            {"instId": a["perp"], "period": "5m", "limit": "100"},
             ["ts", "oi_contracts_5m", "oi_btc_5m", "oi_usd_5m"],
         ),
         (
             "okx_oi_volume_5m",
             "/api/v5/rubik/stat/contracts/open-interest-volume",
-            {"ccy": "BTC", "period": "5m", "limit": "600"},
+            {"ccy": a["ccy"], "period": "5m", "limit": "600"},
             ["ts", "oi_volume_open_5m", "oi_volume_turnover_5m"],
         ),
         (
             "okx_taker_5m",
             "/api/v5/rubik/stat/taker-volume",
-            {"ccy": "BTC", "instType": "CONTRACTS", "period": "5m", "limit": "600"},
+            {"ccy": a["ccy"], "instType": "CONTRACTS", "period": "5m", "limit": "600"},
             ["ts", "taker_buy_5m", "taker_sell_5m"],
         ),
         (
             "okx_lsr_global_5m",
             "/api/v5/rubik/stat/contracts/long-short-account-ratio",
-            {"ccy": "BTC", "period": "5m", "limit": "600"},
+            {"ccy": a["ccy"], "period": "5m", "limit": "600"},
             ["ts", "lsr_global_5m"],
         ),
     ]
     for name, path, params, cols in specs:
         try:
-            raw = fetch_rubik_once(name, path, params, cols, force=force)
+            raw = fetch_rubik_once(name, path, params, cols, force=force, cache_name=f"{pref}{name}")
             if name == "okx_taker_5m" and {"taker_buy_5m", "taker_sell_5m"}.issubset(raw.columns):
                 tot = raw["taker_buy_5m"] + raw["taker_sell_5m"]
                 raw["taker_total_5m"] = tot
@@ -269,7 +282,7 @@ def fetch_short_intraday_external(*, force: bool) -> tuple[pd.DataFrame, pd.Data
     short = merge_on_ts(frames)
     d = DATA_ROOT / "external"
     d.mkdir(parents=True, exist_ok=True)
-    short.to_csv(d / "btc_short_intraday_external_features.csv", index=False)
+    short.to_csv(d / f"{asset}_short_intraday_external_features.csv", index=False)
     return short, pd.DataFrame(inventory)
 
 
@@ -408,11 +421,12 @@ def run_variant(
     include_short: bool,
     funding_hold_cost_mode: str,
     save_panels: bool,
+    perp_key: str = "BTC-USDT-SWAP",
 ) -> tuple[dict, pd.DataFrame]:
     res = {}
     coverage_rows = []
     min_cell_ts = 50
-    btc = perp_dfs["BTC-USDT-SWAP"]
+    btc = perp_dfs[perp_key]
     for H in horizons:
         log(f"{name}: H={H} build panel")
         panel, bar_ms = pmw.build_augmented_bank(perp_dfs, spot_dfs, funding_dfs, bar, H)
@@ -421,7 +435,7 @@ def run_variant(
             or (funding_hold_cost_mode == "auto" and H >= 240)
         )
         if use_funding_hold_cost:
-            panel = apply_funding_hold_cost(panel, funding_dfs.get("BTC-USDT-SWAP"), H)
+            panel = apply_funding_hold_cost(panel, funding_dfs.get(perp_key), H)
         base_cols = set(panel.columns)
         if daily_external is not None:
             short_df = short_external if short_external is not None else pd.DataFrame()
@@ -570,10 +584,11 @@ def parse_existing_btc_report() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def write_comparison(existing: pd.DataFrame, base: pd.DataFrame, enhanced: pd.DataFrame, coverage: pd.DataFrame, inventory: pd.DataFrame) -> str:
+def write_comparison(existing: pd.DataFrame, base: pd.DataFrame, enhanced: pd.DataFrame, coverage: pd.DataFrame, inventory: pd.DataFrame, asset: str = "btc") -> str:
+    A = asset.upper()
     lines = [
         "=" * 92,
-        "BTC single-asset enhanced variable audit",
+        f"{A} single-asset enhanced variable audit",
         "=" * 92,
         "Decision rule: trade only if OOS primary_ic>0.01, at least two confidence buckets pass maker+taker net>0 with NW-t>2, and at least one bucket survives 15 bps stress.",
         "The selected best row is ranked by taker net edge first, then taker t-stat, then maker edge.",
@@ -630,13 +645,15 @@ def write_comparison(existing: pd.DataFrame, base: pd.DataFrame, enhanced: pd.Da
     if tradable:
         lines.append("  CANDIDATE ONLY: an enhanced model passed the historical OOS fee gate. It still needs live shadow validation on the raw L2/trade recorder.")
     else:
-        lines.append("  NO TRADE: the enhanced BTC-specific variables did not prove fee-adjusted out-of-sample net edge. Best model is research-only; size and leverage remain zero.")
+        lines.append(f"  NO TRADE: the enhanced {A}-specific variables did not prove fee-adjusted out-of-sample net edge. Best model is research-only; size and leverage remain zero.")
     lines.append("=" * 92)
     return "\n".join(lines)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="BTC-only enhanced variable audit.")
+    p = argparse.ArgumentParser(description="Single-asset enhanced variable audit (BTC/ETH).")
+    p.add_argument("--asset", default="btc", choices=list(ASSETS.keys()),
+                   help="标的: btc(默认) 或 eth。eth 用同一套特征工程在 ETH 数据上跑。")
     p.add_argument("--days", type=int, default=150)
     p.add_argument("--bar", default="5m")
     p.add_argument("--horizons", default="15,30")
@@ -658,34 +675,37 @@ def main() -> None:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     REPORT_ROOT.mkdir(parents=True, exist_ok=True)
 
+    asset = args.asset
+    a = ASSETS[asset]
+    perp_inst, spot_inst = a["perp"], a["spot"]
     horizons = tuple(int(x) for x in args.horizons.split(",") if x.strip())
     source = "refresh" if args.candle_source == "refresh" else "dist"
-    log("load candles")
-    btc = load_candles("BTC-USDT-SWAP", args.bar, args.days, source=source, force=args.force)
-    spot = load_candles("BTC-USDT", args.bar, args.days, source=source, force=args.force)
-    funding = cd.fetch_funding_series("BTC-USDT-SWAP", args.days + 5, log=log)
+    log(f"load candles ({asset})")
+    btc = load_candles(perp_inst, args.bar, args.days, source=source, force=args.force)
+    spot = load_candles(spot_inst, args.bar, args.days, source=source, force=args.force)
+    funding = cd.fetch_funding_series(perp_inst, args.days + 5, log=log)
 
     span_days = (int(btc["ts"].iloc[-1]) - int(btc["ts"].iloc[0])) / DAY_MS
     meta = {"span_days": round(span_days, 1)}
     pd.DataFrame([{
-        "inst_id": "BTC-USDT-SWAP",
+        "inst_id": perp_inst,
         "bar": args.bar,
         "rows": len(btc),
         "start_utc": ts_utc(btc["ts"].iloc[0]),
         "end_utc": ts_utc(btc["ts"].iloc[-1]),
         "span_days": span_days,
-    }]).to_csv(DATA_ROOT / "btc_candle_inventory.csv", index=False)
+    }]).to_csv(DATA_ROOT / f"{asset}_candle_inventory.csv", index=False)
 
     log("fetch external variables")
-    daily_external, inv_daily = fetch_daily_external(args.days, force=args.force)
-    short_external, inv_short = fetch_short_intraday_external(force=args.force)
+    daily_external, inv_daily = fetch_daily_external(args.days, force=args.force, asset=asset)
+    short_external, inv_short = fetch_short_intraday_external(force=args.force, asset=asset)
     inventory = pd.concat([inv_daily, inv_short], ignore_index=True)
-    inventory.to_csv(DATA_ROOT / "source_inventory_all.csv", index=False)
+    inventory.to_csv(DATA_ROOT / f"{asset}_source_inventory_all.csv", index=False)
 
     costs = pmw.WorkflowCosts()
-    perp_dfs = {"BTC-USDT-SWAP": btc}
-    spot_dfs = {"BTC-USDT-SWAP": spot}
-    funding_dfs = {"BTC-USDT-SWAP": funding}
+    perp_dfs = {perp_inst: btc}
+    spot_dfs = {perp_inst: spot}
+    funding_dfs = {perp_inst: funding}
 
     log("run same-code baseline")
     base_res, base_cov = run_variant(
@@ -693,6 +713,7 @@ def main() -> None:
         bar=args.bar, horizons=horizons, n_folds=args.n_folds, k_sel=args.k_sel,
         preset=args.preset, costs=costs, daily_external=None, short_external=None,
         include_short=False, funding_hold_cost_mode=args.funding_hold_cost, save_panels=False,
+        perp_key=perp_inst,
     )
 
     log("run enhanced variable model")
@@ -702,31 +723,29 @@ def main() -> None:
         preset=args.preset, costs=costs, daily_external=daily_external,
         short_external=short_external, include_short=args.include_short_intraday,
         funding_hold_cost_mode=args.funding_hold_cost,
-        save_panels=args.save_panels,
+        save_panels=args.save_panels, perp_key=perp_inst,
     )
 
+    label = f"{asset.upper()} horizon modeling workflow"
     base_report = pmw.format_report(meta, base_res).replace(
-        "15/30min professional modeling workflow",
-        "BTC horizon modeling workflow",
-    )
+        "15/30min professional modeling workflow", label)
     enhanced_report = pmw.format_report(meta, enh_res).replace(
-        "15/30min professional modeling workflow",
-        "BTC horizon modeling workflow",
-    )
-    (REPORT_ROOT / "btc_same_code_baseline_report.txt").write_text(base_report, encoding="utf-8")
-    (REPORT_ROOT / "btc_enhanced_report.txt").write_text(enhanced_report, encoding="utf-8")
+        "15/30min professional modeling workflow", label)
+    (REPORT_ROOT / f"{asset}_same_code_baseline_report.txt").write_text(base_report, encoding="utf-8")
+    (REPORT_ROOT / f"{asset}_enhanced_report.txt").write_text(enhanced_report, encoding="utf-8")
 
     base_summary = pd.DataFrame(summary_rows(base_res, "baseline"))
     enhanced_summary = pd.DataFrame(summary_rows(enh_res, "enhanced"))
-    existing = parse_existing_btc_report()
+    existing = parse_existing_btc_report() if asset == "btc" else pd.DataFrame()
     coverage = pd.concat([base_cov, enh_cov], ignore_index=True)
-    coverage.to_csv(DATA_ROOT / "feature_coverage.csv", index=False)
-    base_summary.to_csv(DATA_ROOT / "baseline_summary.csv", index=False)
-    enhanced_summary.to_csv(DATA_ROOT / "enhanced_summary.csv", index=False)
+    coverage.to_csv(DATA_ROOT / f"{asset}_feature_coverage.csv", index=False)
+    base_summary.to_csv(DATA_ROOT / f"{asset}_baseline_summary.csv", index=False)
+    enhanced_summary.to_csv(DATA_ROOT / f"{asset}_enhanced_summary.csv", index=False)
 
-    comp = write_comparison(existing, base_summary, enhanced_summary, coverage, inventory)
-    (REPORT_ROOT / "btc_enhanced_comparison.txt").write_text(comp, encoding="utf-8")
+    comp = write_comparison(existing, base_summary, enhanced_summary, coverage, inventory, asset=asset)
+    (REPORT_ROOT / f"{asset}_enhanced_comparison.txt").write_text(comp, encoding="utf-8")
     run_meta = {
+        "asset": asset,
         "days": args.days,
         "bar": args.bar,
         "horizons": horizons,
@@ -738,12 +757,12 @@ def main() -> None:
         "funding_hold_cost": args.funding_hold_cost,
         "has_lightgbm": pmw._HAS_LGBM,
         "outputs": {
-            "comparison": str(REPORT_ROOT / "btc_enhanced_comparison.txt"),
-            "baseline_report": str(REPORT_ROOT / "btc_same_code_baseline_report.txt"),
-            "enhanced_report": str(REPORT_ROOT / "btc_enhanced_report.txt"),
+            "comparison": str(REPORT_ROOT / f"{asset}_enhanced_comparison.txt"),
+            "baseline_report": str(REPORT_ROOT / f"{asset}_same_code_baseline_report.txt"),
+            "enhanced_report": str(REPORT_ROOT / f"{asset}_enhanced_report.txt"),
         },
     }
-    (REPORT_ROOT / "run_meta.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
+    (REPORT_ROOT / f"{asset}_run_meta.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
     print(comp)
 
 
