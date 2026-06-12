@@ -141,9 +141,25 @@ def merge_on_ts(frames: list[pd.DataFrame]) -> pd.DataFrame:
     return out
 
 
+DAILY_EXTERNAL_CACHE_HOURS = 20.0       # 日频外部源(Rubik/DVOL/链上)最多每 ~20h 重取一次
+
+
 def fetch_daily_external(days: int, *, force: bool, asset: str = "btc") -> tuple[pd.DataFrame, pd.DataFrame]:
     a = ASSETS[asset]
     pref = "" if asset == "btc" else f"{asset}_"        # btc reuses existing unprefixed rubik cache
+    out_csv = DATA_ROOT / "external" / f"{asset}_daily_external_features.csv"
+    # 日缓存短路: 组装好的日频外部特征若 <20h 旧, 直接读盘, 完全不碰 Rubik/Deribit/CoinMetrics
+    # (这些是境外/日频源, 每轮 evaluate 都重取既慢又易被拒; 日内复用同一份即可)。
+    if not force and out_csv.exists():
+        try:
+            age_h = (time.time() - out_csv.stat().st_mtime) / 3600.0
+            if age_h < DAILY_EXTERNAL_CACHE_HOURS:
+                cached = pd.read_csv(out_csv)
+                if len(cached):
+                    return cached, pd.DataFrame([{"source": f"{asset}_daily_external_cache",
+                                                  "rows": len(cached), "age_h": round(age_h, 1)}])
+        except Exception:  # noqa: BLE001 - 缓存坏了就照常重取
+            pass
     frames: list[pd.DataFrame] = []
     inventory: list[dict] = []
 
@@ -300,7 +316,8 @@ def source_inventory(name: str, df: pd.DataFrame, use: str, path: str) -> dict:
     }
 
 
-def load_candles(inst_id: str, bar: str, days: int, *, source: str, force: bool) -> pd.DataFrame:
+def load_candles(inst_id: str, bar: str, days: int, *, source: str, force: bool,
+                 update: bool = False) -> pd.DataFrame:
     if source == "dist":
         f = ROOT / "dist" / "candles" / f"{inst_id}_{bar}.csv"
         if f.exists() and not force:
@@ -310,7 +327,7 @@ def load_candles(inst_id: str, bar: str, days: int, *, source: str, force: bool)
                 if span >= days - 2:
                     return df
                 log(f"{inst_id} {bar}: dist cache span={span:.1f}d, refreshing.")
-    return cd.get_candles(inst_id, bar, days, DATA_ROOT / "candles", force=force, log=log)
+    return cd.get_candles(inst_id, bar, days, DATA_ROOT / "candles", force=force, update=update, log=log)
 
 
 def asof_join_features(panel: pd.DataFrame, feat: pd.DataFrame, lag_ms: int, suffix: str) -> pd.DataFrame:

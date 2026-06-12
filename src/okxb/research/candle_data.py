@@ -97,24 +97,70 @@ def _cache_file(root: Path, inst_id: str, bar: str) -> Path:
     return root / f"{inst_id}_{bar}.csv"
 
 
+INCR_MAX_GAP_DAYS = 10.0      # 缓存比这更旧 -> 直接全量重拉(增量翻页太多, 且恐有洞)
+INCR_BUFFER_DAYS = 0.15       # 增量多拉一点与缓存重叠, 保证拼接无缝(无空洞)
+
+
 def get_candles(inst_id: str, bar: str, days: float, root: Path, *,
-                force: bool = False, log: Callable[[str], None] = _log) -> pd.DataFrame:
-    """带磁盘缓存的拉取。缓存覆盖请求范围则直接用; 否则重拉并写盘。"""
+                force: bool = False, update: bool = False,
+                log: Callable[[str], None] = _log) -> pd.DataFrame:
+    """带磁盘缓存的拉取。
+      force=True : 全量重拉并覆盖缓存。
+      update=True: 增量更新——保留缓存, 只拉"缓存最新ts之后"的新 bar 拼接(几次调用而非几百次);
+                   缓存回看不足 / 间隔过大(>INCR_MAX_GAP_DAYS)时自动回退全量; 增量拉空则沿用缓存。
+      默认       : 缓存覆盖请求范围则直接用, 否则全量重拉。"""
     root.mkdir(parents=True, exist_ok=True)
     f = _cache_file(root, inst_id, bar)
-    need_start = int(time.time() * 1000) - int(days * 86_400_000)
-    if f.exists() and not force:
+    now_ms = int(time.time() * 1000)
+    need_start = now_ms - int(days * 86_400_000)
+    bar_ms = BAR_MS[bar]
+
+    def _full() -> pd.DataFrame:
+        df = fetch_history(inst_id, bar, days, log=log)
+        if len(df):
+            df.to_csv(f, index=False)
+        return df
+
+    if force:
+        return _full()
+
+    cache = None
+    if f.exists():
         try:
-            df = pd.read_csv(f)
-            if len(df) > 10 and int(df["ts"].iloc[0]) <= need_start + BAR_MS[bar] * 5:
-                return df
-            log(f"  {inst_id} {bar}: 缓存覆盖不足, 重拉")
+            cache = pd.read_csv(f)
+            cache["ts"] = cache["ts"].astype("int64")
         except Exception as e:  # noqa: BLE001
             log(f"  {inst_id} {bar}: 缓存读取失败 ({e}), 重拉")
-    df = fetch_history(inst_id, bar, days, log=log)
-    if len(df):
-        df.to_csv(f, index=False)
-    return df
+            cache = None
+    if cache is None or len(cache) <= 10:
+        return _full()
+
+    cache_start = int(cache["ts"].iloc[0])
+    cache_max = int(cache["ts"].iloc[-1])
+    covers_start = cache_start <= need_start + bar_ms * 5
+
+    if not update:
+        if covers_start:
+            return cache[cache["ts"] >= need_start].reset_index(drop=True)
+        log(f"  {inst_id} {bar}: 缓存覆盖不足, 重拉")
+        return _full()
+
+    # --- update 增量路径 ---
+    gap_ms = now_ms - cache_max
+    if not covers_start or gap_ms > INCR_MAX_GAP_DAYS * 86_400_000:
+        log(f"  {inst_id} {bar}: 缓存回看不足或间隔过大, 回退全量")
+        return _full()
+    if gap_ms < bar_ms:                                 # 已最新(不足一根新bar)
+        return cache[cache["ts"] >= need_start].reset_index(drop=True)
+    new = fetch_history(inst_id, bar, gap_ms / 86_400_000 + INCR_BUFFER_DAYS, log=log)
+    if not len(new):                                    # 网络没取到新 bar -> 沿用缓存, 不破坏
+        log(f"  {inst_id} {bar}: 增量拉取为空, 沿用现有缓存")
+        return cache[cache["ts"] >= need_start].reset_index(drop=True)
+    merged = (pd.concat([cache, new], ignore_index=True)
+              .drop_duplicates("ts").sort_values("ts").reset_index(drop=True))
+    merged = merged[merged["ts"] >= need_start].reset_index(drop=True)
+    merged.to_csv(f, index=False)
+    return merged
 
 
 def fetch_universe(insts: list[str], bar: str, days: float, root: Path, *,

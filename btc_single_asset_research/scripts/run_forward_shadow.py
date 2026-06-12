@@ -120,16 +120,19 @@ def log(m: str) -> None:
     print(m, flush=True)
 
 
-def _fetch_raw(days: int, *, source: str, force: bool, ext_force: "bool | None" = None) -> dict:
-    """拉取构建面板所需的全部原始输入(K线/资金费/外部源)。这是【唯一的网络密集步骤】;
-    多个 H 复用同一份原始数据, 避免对每个周期重复拉 150 天 K 线(150d 5m≈百次翻页/条)。"""
+def _fetch_raw(days: int, *, source: str, force: bool, ext_force: "bool | None" = None,
+               update: bool = False) -> dict:
+    """拉取构建面板所需的全部原始输入(K线/资金费/外部源)。这是【唯一的网络密集步骤】; 多个 H 复用同一份。
+      update=True : K线走增量(只拉缓存之后的新 bar, 几次调用而非百次翻页), 极大降低网络暴露。
+      ext_force   : 日频外部源是否强制重取; 默认随 force。短周期外部源在 forward 路径(include_short=False)
+                    根本没用到 -> 直接不拉, 省掉一整组 5m Rubik 调用。"""
     if ext_force is None:
         ext_force = force
-    btc = enh.load_candles(PERP, BAR, days, source=source, force=force)
-    spot = enh.load_candles(SPOT, BAR, days, source=source, force=force)
+    btc = enh.load_candles(PERP, BAR, days, source=source, force=force, update=update)
+    spot = enh.load_candles(SPOT, BAR, days, source=source, force=force, update=update)
     funding = cd.fetch_funding_series(PERP, days + 5, log=log)
     daily_external, _ = enh.fetch_daily_external(days, force=ext_force, asset=ASSET)
-    short_external, _ = enh.fetch_short_intraday_external(force=ext_force, asset=ASSET)
+    short_external = pd.DataFrame()        # forward 路径未用短周期外部源 -> 不拉
     return {"btc": btc, "spot": spot, "funding": funding,
             "daily_external": daily_external, "short_external": short_external}
 
@@ -232,10 +235,10 @@ def evaluate() -> None:
         log("no frozen candidates — run --mode freeze first")
         return
     days_max = max(150 + int((now_ms - m["freeze_cutoff_ts"]) / 86_400_000) + 10 for _, _, m in frozen)
-    log(f"[evaluate {ASSET}] 一次性拉原始数据 days={days_max} (K线/外部源仅拉一次, {len(frozen)} 个周期复用)")
-    raw = _fetch_raw(days_max, source="refresh", force=True)
-    if not _raw_ok(raw):            # 受限网络上 force 重拉偶发被拒/返回空 -> 退回缓存
-        log(f"[evaluate {ASSET}] force 重拉 K线为空(网络拒绝/受限), 退回缓存重试...")
+    log(f"[evaluate {ASSET}] 增量拉取(只取新bar)+日缓存外部源, days={days_max}, {len(frozen)} 个周期复用")
+    raw = _fetch_raw(days_max, source="refresh", force=False, update=True)
+    if not _raw_ok(raw):            # 增量也没拿到可用K线 -> 退回纯缓存
+        log(f"[evaluate {ASSET}] 增量 K线为空(网络拒绝/受限), 退回纯缓存...")
         raw = _fetch_raw(days_max, source="refresh", force=False)
     if not _raw_ok(raw):            # 缓存也空 -> 干净跳过, 绝不让空df崩成 IndexError(原 bug)
         log(f"[evaluate {ASSET}] K线仍为空, 本轮评估跳过(不报错)。稍后网络恢复再试; ETH 其它功能不受影响。")
