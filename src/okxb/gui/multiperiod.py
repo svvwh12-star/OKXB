@@ -14,7 +14,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-_MODEL = {"A": "hist_gbm(180min)", "B": "lightgbm(6h)", "C": "mlp(9h)"}
+_MODELS = {
+    "btc": {"A": "hist_gbm(180min)", "B": "lightgbm(6h)", "C": "mlp(9h)"},
+    "eth": {"A": "rf_ret(180min)", "B": "logit_l2(6h)", "C": "hist_gbm(9h)"},
+}
 
 
 def _root() -> Path:
@@ -25,12 +28,19 @@ def _research() -> Path:
     return _root() / "btc_single_asset_research"
 
 
-def forward_status() -> dict:
-    """读 forward_status.csv 最新一批(A/B/C) + shadow_trades 摘要。纯文件, 无需引擎/密钥。"""
-    out: dict = {"ok": False, "rows": [], "shadow": [], "note": ""}
-    fpath = _research() / "forward" / "forward_status.csv"
+def _fwd_dir(asset: str) -> Path:
+    """btc 用原无前缀 forward/ 目录; 其它资产落 forward/{asset}/ (与 run_forward_shadow._set_asset 一致)。"""
+    base = _research() / "forward"
+    return base if asset == "btc" else base / asset
+
+
+def forward_status(asset: str = "btc") -> dict:
+    """读 {asset} 的 forward_status.csv 最新一批(A/B/C) + shadow_trades 摘要。纯文件, 无需引擎/密钥。"""
+    out: dict = {"ok": False, "rows": [], "shadow": [], "note": "", "asset": asset}
+    fpath = _fwd_dir(asset) / "forward_status.csv"
     if not fpath.exists():
-        out["note"] = "未找到 forward_status.csv — 先在 scripts 跑 run_forward_shadow.py --mode evaluate"
+        out["note"] = (f"未找到 {asset.upper()} 的 forward_status.csv — 先跑 "
+                       f"run_forward_shadow.py --asset {asset} --mode evaluate (或开自动)。")
         return out
     try:
         import pandas as pd
@@ -41,7 +51,7 @@ def forward_status() -> dict:
             latest = df.tail(3)
         out["rows"] = latest.fillna("").to_dict("records")
         out["ok"] = True
-        sp = _research() / "forward" / "shadow_trades.csv"
+        sp = _fwd_dir(asset) / "shadow_trades.csv"
         if sp.exists():
             out["shadow"] = pd.read_csv(sp).fillna("").tail(8).to_dict("records")
     except Exception as e:  # noqa: BLE001
@@ -49,8 +59,8 @@ def forward_status() -> dict:
     return out
 
 
-def shadow_run(armed: bool) -> str:
-    """subprocess 跑 run_forward_shadow.py --mode shadow [--arm], 返回精简输出。
+def shadow_run(armed: bool, asset: str = "btc") -> str:
+    """subprocess 跑 run_forward_shadow.py --asset {asset} --mode shadow [--arm], 返回精简输出。
     armed=False: dry-run(公共数据, 不下单); armed=True: 在 demo 真下单(需 OKXB_MODE=demo + demo 密钥)。"""
     script = _research() / "scripts" / "run_forward_shadow.py"
     if not script.exists():
@@ -58,7 +68,8 @@ def shadow_run(armed: bool) -> str:
                 "仅开发态或随附研究目录+python时可用)")
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_root() / "src")
-    cmd = [sys.executable, str(script), "--mode", "shadow"] + (["--arm"] if armed else [])
+    cmd = ([sys.executable, str(script), "--asset", asset, "--mode", "shadow"]
+           + (["--arm"] if armed else []))
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
                            env=env, cwd=str(_research() / "scripts"))
@@ -75,8 +86,8 @@ def shadow_run(armed: bool) -> str:
     return body or "(无输出)"
 
 
-def auto_step(live: bool) -> str:
-    """跑一轮 BTC 多周期自动交易: --mode auto。
+def auto_step(live: bool, asset: str = "btc") -> str:
+    """跑一轮 {asset} 多周期自动交易: --asset {asset} --mode auto。
     demo(live=False): 直接影子下单(执行验证); live=True: 先 evaluate 刷新 verdict, 再【仅对 PASS 候选】实盘下单。
     现状 A/B/C 全 PENDING -> 实盘这步不会下任何单(门控按预期工作)。subprocess, 仅开发态/随附研究目录可用。"""
     script = _research() / "scripts" / "run_forward_shadow.py"
@@ -84,7 +95,8 @@ def auto_step(live: bool) -> str:
         return (f"未找到 {script}\n(多周期自动交易依赖 btc_single_asset_research/; 仅开发态可用)")
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_root() / "src")
-    cmd = [sys.executable, str(script), "--mode", "auto"] + (["--live"] if live else ["--arm"])
+    cmd = ([sys.executable, str(script), "--asset", asset, "--mode", "auto"]
+           + (["--live"] if live else ["--arm"]))
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
                            env=env, cwd=str(_research() / "scripts"))
@@ -113,15 +125,15 @@ def _parse_scores(shadow_out: str) -> dict:
     return out
 
 
-def _get_snapshot() -> dict:
-    """subprocess 跑 --mode snapshot, 解析 {features(客观因子), scores(A/B/C 打分)}。"""
+def _get_snapshot(asset: str = "btc") -> dict:
+    """subprocess 跑 --asset {asset} --mode snapshot, 解析 {features(客观因子), scores(A/B/C 打分)}。"""
     script = _research() / "scripts" / "run_forward_shadow.py"
     if not script.exists():
         return {}
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_root() / "src")
     try:
-        r = subprocess.run([sys.executable, str(script), "--mode", "snapshot"],
+        r = subprocess.run([sys.executable, str(script), "--asset", asset, "--mode", "snapshot"],
                            capture_output=True, text=True, timeout=300,
                            env=env, cwd=str(_research() / "scripts"))
     except Exception:  # noqa: BLE001
@@ -136,13 +148,14 @@ def _get_snapshot() -> dict:
     return {}
 
 
-def ai_compare() -> str:
+def ai_compare(asset: str = "btc") -> str:
     """AI 叙述 vs 量化测量 对照(你的方法论): 给 AI 【只】喂客观因子让它【独立盲分析】,
     程序【另行】并排量化测量 + 写死安全裁决。慢: 含一次 snapshot(拉数据+打分) + 一次 AI 调用。"""
-    snap = _get_snapshot()
+    models = _MODELS.get(asset, _MODELS["btc"])
+    snap = _get_snapshot(asset)
     feats = snap.get("features", {})
     scores = snap.get("scores", {})
-    fs = forward_status()
+    fs = forward_status(asset)
     rows = {str(r.get("code")): r for r in fs.get("rows", [])} if fs.get("ok") else {}
 
     # ① AI 盲分析: 只给客观因子, 不给任何打分/结论(避免锚定)
@@ -165,7 +178,7 @@ def ai_compare() -> str:
     for code in ("A", "B", "C"):
         sc = scores.get(code, {})
         r = rows.get(code, {})
-        qlines.append(f"  {code} {_MODEL.get(code, '')}: 当前打分={sc.get('score', '?')} tau={sc.get('tau', '?')} "
+        qlines.append(f"  {code} {models.get(code, '')}: 当前打分={sc.get('score', '?')} tau={sc.get('tau', '?')} "
                       f"超tau={'是' if sc.get('hit') else '否'} | forward verdict={r.get('verdict', '?')} "
                       f"n_ts={r.get('n_ts', '-')} net10={r.get('net10_bps', '-')}bps fwd_ic={r.get('fwd_ic', '-')}")
     quant = "\n".join(qlines) or "(无量化数据)"
