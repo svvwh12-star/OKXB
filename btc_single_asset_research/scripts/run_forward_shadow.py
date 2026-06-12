@@ -134,6 +134,12 @@ def _fetch_raw(days: int, *, source: str, force: bool, ext_force: "bool | None" 
             "daily_external": daily_external, "short_external": short_external}
 
 
+def _raw_ok(raw: dict) -> bool:
+    """原始输入可用于建面板的最低条件: 永续+现货 K线均非空(受限网络偶发空拉/被拒)。"""
+    btc, spot = raw.get("btc"), raw.get("spot")
+    return btc is not None and len(btc) > 0 and spot is not None and len(spot) > 0
+
+
 def _panel_from_raw(raw: dict, H: int, *, apply_funding: bool):
     """从已拉取的原始输入构建某个 H 的面板(纯 CPU, 无网络)。"""
     btc, funding = raw["btc"], raw["funding"]
@@ -228,6 +234,12 @@ def evaluate() -> None:
     days_max = max(150 + int((now_ms - m["freeze_cutoff_ts"]) / 86_400_000) + 10 for _, _, m in frozen)
     log(f"[evaluate {ASSET}] 一次性拉原始数据 days={days_max} (K线/外部源仅拉一次, {len(frozen)} 个周期复用)")
     raw = _fetch_raw(days_max, source="refresh", force=True)
+    if not _raw_ok(raw):            # 受限网络上 force 重拉偶发被拒/返回空 -> 退回缓存
+        log(f"[evaluate {ASSET}] force 重拉 K线为空(网络拒绝/受限), 退回缓存重试...")
+        raw = _fetch_raw(days_max, source="refresh", force=False)
+    if not _raw_ok(raw):            # 缓存也空 -> 干净跳过, 绝不让空df崩成 IndexError(原 bug)
+        log(f"[evaluate {ASSET}] K线仍为空, 本轮评估跳过(不报错)。稍后网络恢复再试; ETH 其它功能不受影响。")
+        return
 
     rows = []
     for code, d, meta in frozen:
