@@ -202,12 +202,16 @@ class LLMClassifier:
             return _parse_json(txt)
         url = f"{self.base_url}/chat/completions"
         body = {"model": model, "max_tokens": max_tokens, "temperature": 0.2, "stream": False,
-                "response_format": {"type": "json_object"},
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": user}]}
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=40.0) as c:
-            r = await c.post(url, headers=headers, json=body)
+            # 先试 json_object 模式; 若该模型/端点不支持(常见 400), 去掉 response_format 重试
+            # (prompt 已明确要求 JSON, _parse_json 有稳健兜底)。这修"ping通但JSON调用挂"的症状。
+            r = await c.post(url, headers=headers, json={**body, "response_format": {"type": "json_object"}})
+            if r.status_code >= 400:
+                print(f"[llm] json_object 被拒({r.status_code}), 降级为普通+解析重试: {r.text[:160]}")
+                r = await c.post(url, headers=headers, json=body)
             if r.status_code >= 400:        # 带出服务端真实原因, 否则只看到裸 400 无从排查
                 raise RuntimeError(f"{self.provider} {r.status_code} @ chat/completions: {r.text[:400]}")
             msg = r.json()["choices"][0]["message"]

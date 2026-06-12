@@ -12,6 +12,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from .. import paths
+from . import multiperiod
 from .controller import TOOLTIPS
 from .controller import (PARAM_DEFS, EngineController, account_brief_sync, ai_analyze_sync,
                          ai_pick_sync, apply_calibration_sync, apply_params, calib_files_info,
@@ -109,11 +110,13 @@ class OKXBApp(ctk.CTk):
         self._tab_calib = self._tabs.add("策略校准")
         self._tab_cred = self._tabs.add("账户与密钥")
         self._tab_log = self._tabs.add("日志")
+        self._tab_multi = self._tabs.add("多周期研究")
         self._build_console_tab()
         self._build_manual_tab()
         self._build_calib_tab()
         self._build_credentials_tab()
         self._build_logs_tab()
+        self._build_multi_tab()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(800, self._refresh)
@@ -798,6 +801,105 @@ class OKXBApp(ctk.CTk):
         self.log_box.insert("end", "引擎日志将显示在此。\n")
         self.log_box.configure(state="disabled")
 
+    # ----------------- 多周期研究 (只读监控 + demo 影子执行验证) -----------------
+
+    def _build_multi_tab(self) -> None:
+        t = self._tab_multi
+        ctk.CTkLabel(t, text="多周期研究监控 (只读 + demo 影子执行验证)", font=FONT_B,
+                     anchor="w").pack(fill="x", padx=12, pady=(6, 0))
+        ctk.CTkLabel(t, text="只读研究面板: 不替换控制台方向源、不驱动实盘下单。亮灯由 forward 状态驱动"
+                     "(非历史回测gate): 🟢PASS=进第二阶段(仍非实盘) 🟡PENDING=观察中 🔴KILL=已关闭。"
+                     "现状 A/B/C 全 PENDING(研究观察期, 不可交易)。影子=仅模拟盘执行真实性验证, 非盈利, 预期亏/打平。",
+                     font=("Microsoft YaHei UI", 11), text_color=GREY, anchor="w",
+                     wraplength=960, justify="left").pack(fill="x", padx=12)
+        self.multi_status = ctk.CTkTextbox(t, height=190, font=MONO)
+        self.multi_status.pack(fill="x", padx=8, pady=(6, 2))
+        self.multi_status.configure(state="disabled")
+        br = ctk.CTkFrame(t, fg_color="transparent")
+        br.pack(fill="x", padx=8, pady=2)
+        ctk.CTkButton(br, text="↻ 刷新状态", font=FONT, width=90,
+                      command=self._multi_refresh_now).pack(side="left", padx=4)
+        ctk.CTkButton(br, text="🔬 影子干运行(不下单)", font=FONT_B, width=170, fg_color="#7a5cff",
+                      command=lambda: self._multi_shadow(False)).pack(side="left", padx=4)
+        self.multi_arm_btn = ctk.CTkButton(br, text="🎯 在模拟盘执行(demo)", font=FONT_B, width=170,
+                                           fg_color=AMBER, command=lambda: self._multi_shadow(True))
+        self.multi_arm_btn.pack(side="left", padx=4)
+        ctk.CTkLabel(br, text="(demo 真下单: 顶部切『虚拟盘』+ 配 demo 密钥)",
+                     font=("Microsoft YaHei UI", 11), text_color=GREY).pack(side="left", padx=6)
+        self.multi_result = ctk.CTkTextbox(t, font=MONO)
+        self.multi_result.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        self.multi_result.insert("end", "点『影子干运行』看 A/B/C 当前会不会触发 tau(纯公共数据, 不下单)。\n")
+        self.multi_result.configure(state="disabled")
+        self._multi_busy = False
+        self._multi_refresh_now()
+
+    def _multi_set_status(self, data: dict) -> None:
+        lines = []
+        if not data.get("ok"):
+            lines.append(data.get("note", "无 forward 状态 (先在 scripts 跑 --mode evaluate)"))
+        else:
+            asof = data["rows"][0].get("asof_utc", "") if data["rows"] else ""
+            lines.append(f"A/B/C forward 状态 (asof {asof}):")
+            emj = {"PASS": "🟢", "KILL": "🔴"}
+            for r in data["rows"]:
+                v = str(r.get("verdict", "PENDING"))
+                lines.append(f"  {emj.get(v, '🟡')} {r.get('code', '?')} H={r.get('H', '?')}min "
+                             f"n_ts={r.get('n_ts', '-')} net10={r.get('net10_bps', '-')} "
+                             f"net15={r.get('net15_bps', '-')} fwd_ic={r.get('fwd_ic', '-')} -> {v}")
+            if data.get("shadow"):
+                lines.append("影子成交(最近):")
+                for s in data["shadow"][-6:]:
+                    lines.append(f"  {s.get('entry_utc', '')} {s.get('code', '')} {s.get('side', '')} "
+                                 f"{s.get('event', '')} {s.get('exit_reason', '')} "
+                                 f"名义{s.get('notional', '')}U")
+        self.multi_status.configure(state="normal")
+        self.multi_status.delete("1.0", "end")
+        self.multi_status.insert("end", "\n".join(lines) + "\n")
+        self.multi_status.configure(state="disabled")
+
+    def _multi_refresh_now(self) -> None:
+        def work():
+            data = multiperiod.forward_status()
+            self.after(0, lambda: self._multi_set_status(data))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _maybe_refresh_multi(self) -> None:
+        try:
+            if self._tabs.get() != "多周期研究" or self._tick_count % 12 != 0:
+                return
+        except Exception:
+            return
+        self._multi_refresh_now()
+
+    def _multi_result_set(self, text: str) -> None:
+        self.multi_result.configure(state="normal")
+        self.multi_result.delete("1.0", "end")
+        self.multi_result.insert("end", text + "\n")
+        self.multi_result.configure(state="disabled")
+
+    def _multi_shadow(self, armed: bool) -> None:
+        if armed and not messagebox.askyesno(
+                "确认在模拟盘执行",
+                "将在【模拟盘(demo)】按 A/B/C 信号自动下单(执行真实性验证, 非盈利, 预期亏/打平)。\n"
+                "需顶部已切到『虚拟盘』且配好 demo 密钥。确认?"):
+            return
+        if self._multi_busy:
+            return
+        self._multi_busy = True
+        self.multi_arm_btn.configure(state="disabled")
+        self._multi_result_set("... 影子运行中 (拉数据 + 冻结模型打分, 约 30-90 秒) ...")
+
+        def work():
+            txt = multiperiod.shadow_run(armed)
+
+            def done():
+                self._multi_result_set(txt)
+                self._multi_busy = False
+                self.multi_arm_btn.configure(state="normal")
+                self._multi_refresh_now()
+            self.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
+
     # ----------------- 手动交易 -----------------
 
     def _build_manual_tab(self) -> None:
@@ -1393,6 +1495,7 @@ class OKXBApp(ctk.CTk):
         for line in self.ctrl.drain_logs():
             self._append_log(line)
         self._maybe_autorefresh_orders()
+        self._maybe_refresh_multi()
 
         running = self.ctrl.running
         # 确定性按运行态设置按钮 (修复"停止点不动": 之前竞态会在启动后误禁用停止)
