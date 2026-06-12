@@ -235,7 +235,7 @@ def evaluate() -> None:
 
 
 def guard_demo() -> Optional[str]:
-    """Fail-closed: shadow auto-trade is allowed ONLY in the demo (simulated) account."""
+    """Fail-closed: demo shadow auto-trade is allowed ONLY in the demo (simulated) account."""
     try:
         m = Secrets().mode
     except Exception as e:  # noqa: BLE001
@@ -244,6 +244,38 @@ def guard_demo() -> Optional[str]:
         return (f"拒绝: 当前 OKXB_MODE={getattr(m, 'value', m)}; 影子自动交易仅限模拟盘(demo)。"
                 "请在 .env 设 OKXB_MODE=demo 并配 demo 密钥后再用 --arm。")
     return None
+
+
+def guard_live() -> Optional[str]:
+    """Fail-closed: LIVE auto-trade requires OKXB_MODE=live (a separate, deliberate switch)."""
+    try:
+        m = Secrets().mode
+    except Exception as e:  # noqa: BLE001
+        return f"无法读取交易模式(.env): {e!r}"
+    if m != Mode.LIVE:
+        return (f"拒绝: 当前 OKXB_MODE={getattr(m, 'value', m)}; 实盘多周期自动交易需 OKXB_MODE=live "
+                "并配实盘密钥。")
+    return None
+
+
+def _latest_verdicts() -> dict:
+    """最近一批 A/B/C 的 forward verdict ({} 表示尚未 evaluate)。实盘 PASS 门控的依据。"""
+    f = FWD / "forward_status.csv"
+    if not f.exists():
+        return {}
+    try:
+        df = pd.read_csv(f)
+        if "asof_utc" in df.columns and len(df):
+            df = df[df["asof_utc"] == df["asof_utc"].iloc[-1]]
+        return {str(r["code"]): str(r.get("verdict", "PENDING"))
+                for _, r in df.iterrows() if pd.notna(r.get("code"))}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _live_gated(frozen: list, verdicts: dict) -> list:
+    """实盘可下单候选 = forward verdict 严格为 PASS 的。PENDING/KILL 一律不可实盘 —— 不可绕过的边际门控。"""
+    return [c for c in frozen if verdicts.get(c) == "PASS"]
 
 
 def shadow_size(equity: float, risk_pct: float, sl_pct: float, price: float) -> tuple[float, float]:
@@ -320,12 +352,20 @@ def _append_trade(rec: dict) -> None:
     pd.DataFrame([rec]).to_csv(SHADOW_TRADES, mode="a", header=not SHADOW_TRADES.exists(), index=False)
 
 
-def shadow(armed: bool = False) -> None:
-    """DEMO-only serial single-slot shadow auto-trade. Default DRY-RUN (no orders);
-    --arm places real demo orders via the existing manual trade path. Records paper-vs-fill."""
-    if armed and (err := guard_demo()):
+def shadow(armed: bool = False, live: bool = False) -> None:
+    """Serial single-slot multi-period auto-trade for BTC (one open slot across A/B/C).
+      dry-run (default): show the decision only, place nothing.
+      --arm  (demo)    : real DEMO orders on tau-hit for ALL frozen candidates (execution-reality test).
+      --live (real $)  : real LIVE orders ONLY for candidates whose forward verdict==PASS (the edge gate);
+                          all PENDING -> nothing placed. Requires OKXB_MODE=live.
+    The PASS gate on the live path is non-negotiable: live never trades un-validated edge."""
+    if live and (err := guard_live()):
         log(err)
         return
+    if armed and not live and (err := guard_demo()):
+        log(err)
+        return
+    place = armed or live
     inst = "BTC-USDT-SWAP"
     now = int(time.time() * 1000)
     st = json.loads(SHADOW_STATE.read_text(encoding="utf-8")) if SHADOW_STATE.exists() else None
@@ -333,7 +373,7 @@ def shadow(armed: bool = False) -> None:
     if st:                                              # holding -> monitor exit
         due = now >= st["entry_ts"] + st["H"] * 60_000
         mins = (st["entry_ts"] + st["H"] * 60_000 - now) / 60000.0
-        if not armed:
+        if not place:
             log(f"[shadow {st['code']}] (dry) 持仓中 {st['side']} 距H平仓 {mins:.0f}min" + (" → 将time-exit" if due else ""))
             return
         from okxb.gui import controller as gctl
@@ -355,14 +395,22 @@ def shadow(armed: bool = False) -> None:
         return
 
     eq = float(Config.load().get("account.initial_equity_usdt", 1000) or 1000)   # flat -> consider entry
-    if armed:
+    if place:
         from okxb.gui import controller as gctl
         br = gctl.account_brief_sync()
         if br.get("ok"):
             eq = float(br.get("equity") or eq)
-    for code in CANDIDATES:
-        if not (FROZEN / code / "meta.json").exists():
-            continue
+    frozen = [c for c in CANDIDATES if (FROZEN / c / "meta.json").exists()]
+    if live:                                            # 实盘: 只对 forward verdict=PASS 的候选下单
+        verdicts = _latest_verdicts()
+        codes = _live_gated(frozen, verdicts)
+        if not codes:
+            log(f"[shadow] 实盘门控: 无 PASS 候选 (verdicts={verdicts or '未评估'}); 实盘不下单。"
+                "这是 PASS 门控按预期工作, 非故障 —— 现状全 PENDING。")
+            return
+    else:                                               # demo / dry-run: 全部已冻结候选(执行真实性验证)
+        codes = frozen
+    for code in codes:
         sig = _score_now(code)
         if not sig["tau_hit"]:
             log(f"[shadow {code}] score={sig['score']:+.4f} tau={sig['tau']:.4f} 未达高置信, 跳过。")
@@ -376,19 +424,29 @@ def shadow(armed: bool = False) -> None:
                 "entry_utc": enh.ts_utc(now), "entry_mid": sig["mid"], "score": round(sig["score"], 4),
                 "notional": notional, "lever": lever, "sl_pct": sl_pct, "tp_pct": tp_pct,
                 "tp_px": tp_px, "sl_px": sl_px}
-        if not armed:
+        if not place:
             log(f"[shadow {code}] (dry) 将入场 {sig['side']} 名义≈{notional}U 杠杆{lever}x "
-                f"TP={tp_px} SL={sl_px} (现价{sig['mid']}) — 加 --arm 才在 demo 真下单。")
+                f"TP={tp_px} SL={sl_px} (现价{sig['mid']}) — 加 --arm(demo)/--live(实盘,仅PASS) 才真下单。")
             return
+        acct = "live" if live else "demo"
+        plan["account"] = acct
         from okxb.gui import controller as gctl
         gctl.manual_set_leverage_sync(inst, int(lever))
         res = gctl.manual_bracket_sync(inst, sig["side"], SHADOW_ORD, notional, "usdt", None, tp_px, sl_px)
         plan.update({"event": "entry", "order_result": res})
         SHADOW_STATE.write_text(json.dumps(plan, indent=2), encoding="utf-8")
         _append_trade(plan)
-        log(f"[shadow {code}] 入场(demo): {res}")
+        log(f"[shadow {code}] 入场({acct}): {res}")
         return
     log("[shadow] 当前无候选达高置信 tau, 不入场 (常态: 信号稀疏且 gate=False)。")
+
+
+def auto(live: bool = False) -> None:
+    """一轮自动交易: 实盘先 evaluate 刷新 forward verdict(PASS门控依据)再 shadow;
+    demo 直接 shadow(执行真实性验证)。供 GUI / 计划任务每隔 N 分钟调用一次。"""
+    if live:
+        evaluate()                  # 实盘门控需要最新 verdict
+    shadow(armed=not live, live=live)
 
 
 def snapshot() -> None:
@@ -420,17 +478,26 @@ def selftest() -> None:
     assert abs(n2 - 3000.0) < 1e-6 and abs(lv2 - 3.0) < 1e-6
     sl, tp = tp_sl_pct(35.0, 180)
     assert tp > sl > 0.0
+    # live PASS-gate: only verdict==PASS candidates are tradable live; all-PENDING -> none
+    assert _live_gated(["A", "B", "C"], {"A": "PENDING", "B": "PASS", "C": "KILL"}) == ["B"]
+    assert _live_gated(["A", "B", "C"], {"A": "PENDING", "B": "PENDING", "C": "PENDING"}) == []
+    assert _live_gated(["A", "B", "C"], {}) == []                       # not evaluated yet -> none
     log("selftest OK")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Forward shadow test (pre-registered).")
-    ap.add_argument("--mode", choices=["freeze", "evaluate", "selftest", "shadow", "snapshot"], required=True)
+    ap.add_argument("--mode", choices=["freeze", "evaluate", "selftest", "shadow", "snapshot", "auto"],
+                    required=True)
     ap.add_argument("--arm", action="store_true",
-                    help="shadow 模式下真在 demo 下单 (默认 dry-run: 只显示决策, 不下单)")
+                    help="shadow/auto 下真在 demo 下单 (默认 dry-run: 只显示决策, 不下单)")
+    ap.add_argument("--live", action="store_true",
+                    help="实盘下单, 仅对 forward verdict=PASS 的候选 (需 OKXB_MODE=live); 全 PENDING 则不下单")
     args = ap.parse_args()
     if args.mode == "shadow":
-        shadow(armed=args.arm)
+        shadow(armed=args.arm, live=args.live)
+    elif args.mode == "auto":
+        auto(live=args.live)
     else:
         {"freeze": freeze, "evaluate": evaluate, "selftest": selftest, "snapshot": snapshot}[args.mode]()
 

@@ -75,6 +75,33 @@ def shadow_run(armed: bool) -> str:
     return body or "(无输出)"
 
 
+def auto_step(live: bool) -> str:
+    """跑一轮 BTC 多周期自动交易: --mode auto。
+    demo(live=False): 直接影子下单(执行验证); live=True: 先 evaluate 刷新 verdict, 再【仅对 PASS 候选】实盘下单。
+    现状 A/B/C 全 PENDING -> 实盘这步不会下任何单(门控按预期工作)。subprocess, 仅开发态/随附研究目录可用。"""
+    script = _research() / "scripts" / "run_forward_shadow.py"
+    if not script.exists():
+        return (f"未找到 {script}\n(多周期自动交易依赖 btc_single_asset_research/; 仅开发态可用)")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_root() / "src")
+    cmd = [sys.executable, str(script), "--mode", "auto"] + (["--live"] if live else ["--arm"])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                           env=env, cwd=str(_research() / "scripts"))
+    except subprocess.TimeoutExpired:
+        return "自动一轮超时(>600s; 实盘会先 evaluate 拉 150d 数据, 较慢)。"
+    except Exception as e:  # noqa: BLE001
+        return f"运行失败: {e!r}\n(打包 .exe 无法跑脚本; 请用开发态 python okxb_gui.py)"
+    txt = r.stdout or ""
+    keys = ("shadow", "门控", "入场", "跳过", "不入场", "verdict", "PASS", "KILL", "demo", "live",
+            "Error", "失败", "拒绝", "Traceback")
+    lines = [ln for ln in txt.splitlines() if any(k in ln for k in keys)]
+    body = "\n".join(lines[-30:]) if lines else txt[-1500:]
+    if r.returncode != 0 and r.stderr:
+        body += "\n[stderr]\n" + r.stderr[-600:]
+    return body or "(无输出)"
+
+
 def _parse_scores(shadow_out: str) -> dict:
     """从 shadow dry-run 输出解析每个候选当前的 score/tau。"""
     out: dict = {}
