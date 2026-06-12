@@ -372,6 +372,32 @@ class LLMClassifier:
         except Exception as e:
             return f"AI 解读失败: {e!r}"
 
+    async def analyze_market(self, objective_text: str) -> str:
+        """对一份【客观市场数据快照】做系统、严谨、客观的【独立】分析(盲: 不给任何模型打分/结论)。
+        用于'AI 叙述 vs 量化测量'对照: AI 独立给方向/逐因子/置信/风险, 由程序另行并排量化结论。
+        铁律: 只基于给定数据, 不得编造数据外的新闻/事件/价格; 这是研究对照, 不是交易指令。"""
+        if not self.enabled:
+            return "未配置 AI (当前=规则或未填 key)。请到『账户与密钥』选 DeepSeek 填 Key 后再用。"
+        sysp = (
+            "你是资深的加密货币永续合约【中短线(数小时到数日)】量化分析师。"
+            "基于下面给定的【客观市场数据快照】做系统、严谨、客观的【独立】分析(这是研究对照, 不是交易指令)。\n"
+            "要求, 务必分点:\n"
+            "1) 逐维度评估, 每条标明该维度倾向(偏多/偏空/中性)及理由: "
+            "①价格趋势与近端动量; ②波动率regime(已实现RV与隐含DVOL的高低及其差/VRP的含义); "
+            "③衍生品结构(资金费率正负与量级、OI周转变化、永续-现货基差); "
+            "④持仓情绪(多空账户比); ⑤链上(交易所净流入、MVRV、活跃地址)若给出。\n"
+            "2) 综合方向倾向(做多/做空/观望)+置信度(低/中/高), 说明主要依据与彼此矛盾之处。\n"
+            "3) 关键风险与不确定性: 明确指出数据不足以支撑高把握的地方。\n"
+            "铁律: 严禁编造任何数据之外的新闻/财报/社媒/价格; 只能基于给定数据推断; "
+            "明确区分'数据直接支持'与'经验性推测'。务必中文, 分点, 总字数<=380。")
+        user = (f"客观市场数据快照(BTC-USDT 永续, 多周期中短线视角):\n{objective_text}\n\n"
+                "请按上述三点给出你的独立专业分析。")
+        try:
+            txt = await self._chat(self.model_hard, sysp, user, max_tokens=1000)
+            return txt.strip() or "AI 未返回内容。"
+        except Exception as e:
+            return f"AI 分析失败: {e!r}"
+
     # ----------------- OpenAI 兼容 (DeepSeek 等) -----------------
 
     async def _classify_openai(self, model, ticker, text, kind, items) -> dict:

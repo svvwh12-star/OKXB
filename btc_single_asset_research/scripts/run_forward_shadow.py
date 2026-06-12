@@ -287,8 +287,32 @@ def _score_now(code: str) -> dict:
           if "btc_rv_1d_ann_pct" in last and pd.notna(last["btc_rv_1d_ann_pct"].iloc[0]) else 35.0)
     cand = enh.load_candles("BTC-USDT-SWAP", BAR, 30, source="refresh", force=False)  # reuse cache build_panel just wrote
     mid = float(cand["c"].iloc[-1]) if len(cand) else float("nan")
+
+    def _g(col):                                    # human-readable OBJECTIVE factor (no model output)
+        try:
+            v = last[col].iloc[0] if col in last.columns else None
+            return round(float(v), 6) if v is not None and np.isfinite(float(v)) else None
+        except Exception:  # noqa: BLE001
+            return None
+    feat = {k: v for k, v in {
+        "BTC现价": round(mid, 1) if np.isfinite(mid) else None,
+        "近端动量roc": _g("roc"),
+        "1日年化已实现波动%": round(dv, 1) if np.isfinite(dv) else None,
+        "DVOL隐含波动": _g("dvol_daily"),
+        "VRP(IV^2-RV^2)": _g("vrp_dvol2_minus_rv2_1d"),
+        "DVOL-RV价差": _g("dvol_minus_rv_1d"),
+        "资金费率(最近)": _g("funding_last"),
+        "永续-现货基差": _g("basis"),
+        "OI周转变化": _g("okx_oi_volume_1d_oi_volume_turnover_chg1"),
+        "主动买卖不平衡z": _g("okx_taker_1d_taker_imb_z20"),
+        "多空账户比": _g("okx_lsr_global_1d_lsr_global"),
+        "交易所净流入z(链上)": _g("cm_FlowInExNtv_z20"),
+        "MVRV(链上)": _g("cm_CapMVRVCur"),
+        "活跃地址变化(链上)": _g("cm_AdrActCnt_chg1"),
+    }.items() if v is not None}
     return {"code": code, "H": H, "tau": tau, "score": sc, "tau_hit": abs(sc) >= tau,
-            "side": "buy" if sc > 0 else "sell", "ts": int(last["ts"].iloc[0]), "daily_vol": dv, "mid": mid}
+            "side": "buy" if sc > 0 else "sell", "ts": int(last["ts"].iloc[0]),
+            "daily_vol": dv, "mid": mid, "feat": feat}
 
 
 def _append_trade(rec: dict) -> None:
@@ -367,6 +391,22 @@ def shadow(armed: bool = False) -> None:
     log("[shadow] 当前无候选达高置信 tau, 不入场 (常态: 信号稀疏且 gate=False)。")
 
 
+def snapshot() -> None:
+    """输出【客观因子】+ A/B/C 当前打分(JSON, 前缀 SNAPSHOT_JSON)。
+    features 是给 AI 盲分析的客观数据(不含任何模型结论); scores 单独给程序做对照。"""
+    feats: dict = {}
+    scores: dict = {}
+    for code in CANDIDATES:
+        if not (FROZEN / code / "meta.json").exists():
+            continue
+        sig = _score_now(code)
+        scores[code] = {"H": sig["H"], "score": round(sig["score"], 4), "tau": round(sig["tau"], 4),
+                        "hit": bool(sig["tau_hit"]), "side": sig["side"]}
+        if not feats:
+            feats = sig.get("feat", {})
+    print("SNAPSHOT_JSON " + json.dumps({"features": feats, "scores": scores}, ensure_ascii=False))
+
+
 def selftest() -> None:
     assert forward_verdict(5.0, 2.5, 6.0, 60, 1, 1, 2.0) == "PASS"
     assert forward_verdict(5.0, 2.5, 6.0, 40, 1, 1, 2.0) == "PENDING"   # n<50
@@ -385,14 +425,14 @@ def selftest() -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Forward shadow test (pre-registered).")
-    ap.add_argument("--mode", choices=["freeze", "evaluate", "selftest", "shadow"], required=True)
+    ap.add_argument("--mode", choices=["freeze", "evaluate", "selftest", "shadow", "snapshot"], required=True)
     ap.add_argument("--arm", action="store_true",
                     help="shadow 模式下真在 demo 下单 (默认 dry-run: 只显示决策, 不下单)")
     args = ap.parse_args()
     if args.mode == "shadow":
         shadow(armed=args.arm)
     else:
-        {"freeze": freeze, "evaluate": evaluate, "selftest": selftest}[args.mode]()
+        {"freeze": freeze, "evaluate": evaluate, "selftest": selftest, "snapshot": snapshot}[args.mode]()
 
 
 if __name__ == "__main__":

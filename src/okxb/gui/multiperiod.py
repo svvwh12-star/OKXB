@@ -86,29 +86,68 @@ def _parse_scores(shadow_out: str) -> dict:
     return out
 
 
-def ai_compare() -> str:
-    """组装多周期量化结论(forward 状态 + 当前打分) -> 喂 AI 做【只读】对照解读。
-    慢: 含一次影子 dry-run(拉数据+打分) + 一次 AI 调用。AI 被硬约束不得把 PENDING/KILL 说成机会。"""
-    fs = forward_status()
-    if not fs.get("ok"):
-        return fs.get("note", "无 forward 状态; 先在 scripts 跑 run_forward_shadow.py --mode evaluate")
-    scores = _parse_scores(shadow_run(False))               # 当前 A/B/C 打分(dry-run, 不下单)
-    lines = []
-    for r in fs.get("rows", []):
-        code = str(r.get("code", "?"))
-        sc = scores.get(code, {})
-        hit = "是" if sc and abs(sc.get("score", 0.0)) >= sc.get("tau", 1e9) else "否"
-        lines.append(
-            f"候选{code} {_MODEL.get(code, '')}: 当前打分={sc.get('score', '?')} tau={sc.get('tau', '?')} "
-            f"超tau={hit} | forward: n_ts={r.get('n_ts', '-')} net10={r.get('net10_bps', '-')}bps "
-            f"net15={r.get('net15_bps', '-')}bps fwd_ic={r.get('fwd_ic', '-')} verdict={r.get('verdict', 'PENDING')}")
-    quant_text = "\n".join(lines) or "(无候选数据)"
+def _get_snapshot() -> dict:
+    """subprocess 跑 --mode snapshot, 解析 {features(客观因子), scores(A/B/C 打分)}。"""
+    script = _research() / "scripts" / "run_forward_shadow.py"
+    if not script.exists():
+        return {}
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_root() / "src")
     try:
-        import asyncio
+        r = subprocess.run([sys.executable, str(script), "--mode", "snapshot"],
+                           capture_output=True, text=True, timeout=300,
+                           env=env, cwd=str(_research() / "scripts"))
+    except Exception:  # noqa: BLE001
+        return {}
+    import json
+    for ln in (r.stdout or "").splitlines():
+        if ln.startswith("SNAPSHOT_JSON "):
+            try:
+                return json.loads(ln[len("SNAPSHOT_JSON "):])
+            except Exception:  # noqa: BLE001
+                return {}
+    return {}
 
-        from ..config import Secrets
-        from ..events.llm_classifier import LLMClassifier
-        ai = asyncio.run(LLMClassifier.from_secrets(Secrets()).explain_quant_monitor(quant_text))
-    except Exception as e:  # noqa: BLE001
-        ai = f"AI 解读失败: {e!r}"
-    return "【量化结论(喂给 AI 的客观数据)】\n" + quant_text + "\n\n" + ai
+
+def ai_compare() -> str:
+    """AI 叙述 vs 量化测量 对照(你的方法论): 给 AI 【只】喂客观因子让它【独立盲分析】,
+    程序【另行】并排量化测量 + 写死安全裁决。慢: 含一次 snapshot(拉数据+打分) + 一次 AI 调用。"""
+    snap = _get_snapshot()
+    feats = snap.get("features", {})
+    scores = snap.get("scores", {})
+    fs = forward_status()
+    rows = {str(r.get("code")): r for r in fs.get("rows", [])} if fs.get("ok") else {}
+
+    # ① AI 盲分析: 只给客观因子, 不给任何打分/结论(避免锚定)
+    if feats:
+        obj_text = "\n".join(f"  {k}: {v}" for k, v in feats.items())
+        try:
+            import asyncio
+
+            from ..config import Secrets
+            from ..events.llm_classifier import LLMClassifier
+            ai = asyncio.run(LLMClassifier.from_secrets(Secrets()).analyze_market(obj_text))
+        except Exception as e:  # noqa: BLE001
+            ai = f"AI 分析失败: {e!r}"
+    else:
+        obj_text, ai = "(未取到客观因子; 多周期研究依赖 btc_single_asset_research/, 仅开发态可用)", \
+            "无客观数据, 跳过 AI 分析。"
+
+    # ② 量化测量(程序独立呈现, AI 看不到)
+    qlines = []
+    for code in ("A", "B", "C"):
+        sc = scores.get(code, {})
+        r = rows.get(code, {})
+        qlines.append(f"  {code} {_MODEL.get(code, '')}: 当前打分={sc.get('score', '?')} tau={sc.get('tau', '?')} "
+                      f"超tau={'是' if sc.get('hit') else '否'} | forward verdict={r.get('verdict', '?')} "
+                      f"n_ts={r.get('n_ts', '-')} net10={r.get('net10_bps', '-')}bps fwd_ic={r.get('fwd_ic', '-')}")
+    quant = "\n".join(qlines) or "(无量化数据)"
+
+    note = ("【对照与裁决】① 是 AI 基于客观数据的【独立叙述视角】(它看不到量化打分/结论); "
+            "③ 是严格的样本外净edge闸门 + forward 状态。二者可能给出不同方向——这正是"
+            "'AI 叙述 vs 统计净edge'的区别。【最终交易裁决以量化为准】: A/B/C 现状均 PENDING"
+            "(统计上无稳健净edge), 故即使 AI 给出明确方向, 也【不可交易】。")
+    return ("【① AI 独立分析(只看客观数据, 不知量化结论)】\n" + ai +
+            "\n\n【② 喂给 AI 的客观数据快照】\n" + obj_text +
+            "\n\n【③ 量化测量(程序独立, AI 未见)】\n" + quant +
+            "\n\n" + note)
