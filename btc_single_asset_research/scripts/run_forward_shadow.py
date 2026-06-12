@@ -120,11 +120,9 @@ def log(m: str) -> None:
     print(m, flush=True)
 
 
-def build_panel(H: int, *, days: int, source: str, force: bool, apply_funding: bool,
-                ext_force: "bool | None" = None):
-    """Reproduce the enhanced pipeline (build_augmented_bank + funding-hold + enrich) for one H.
-    ext_force controls re-fetch of the daily external sources (rubik/DVOL/on-chain); defaults to
-    `force`. Live shadow scoring passes ext_force=False to reuse the daily cache (fast)."""
+def _fetch_raw(days: int, *, source: str, force: bool, ext_force: "bool | None" = None) -> dict:
+    """拉取构建面板所需的全部原始输入(K线/资金费/外部源)。这是【唯一的网络密集步骤】;
+    多个 H 复用同一份原始数据, 避免对每个周期重复拉 150 天 K 线(150d 5m≈百次翻页/条)。"""
     if ext_force is None:
         ext_force = force
     btc = enh.load_candles(PERP, BAR, days, source=source, force=force)
@@ -132,12 +130,26 @@ def build_panel(H: int, *, days: int, source: str, force: bool, apply_funding: b
     funding = cd.fetch_funding_series(PERP, days + 5, log=log)
     daily_external, _ = enh.fetch_daily_external(days, force=ext_force, asset=ASSET)
     short_external, _ = enh.fetch_short_intraday_external(force=ext_force, asset=ASSET)
-    perp = {PERP: btc}
-    panel, bar_ms = pmw.build_augmented_bank(perp, {PERP: spot}, {PERP: funding}, BAR, H)
+    return {"btc": btc, "spot": spot, "funding": funding,
+            "daily_external": daily_external, "short_external": short_external}
+
+
+def _panel_from_raw(raw: dict, H: int, *, apply_funding: bool):
+    """从已拉取的原始输入构建某个 H 的面板(纯 CPU, 无网络)。"""
+    btc, funding = raw["btc"], raw["funding"]
+    panel, bar_ms = pmw.build_augmented_bank({PERP: btc}, {PERP: raw["spot"]}, {PERP: funding}, BAR, H)
     if apply_funding:
         panel = enh.apply_funding_hold_cost(panel, funding, H)
-    panel = enh.enrich_panel(panel, btc, BAR, daily_external, short_external, include_short=False)
+    panel = enh.enrich_panel(panel, btc, BAR, raw["daily_external"], raw["short_external"], include_short=False)
     return panel, bar_ms
+
+
+def build_panel(H: int, *, days: int, source: str, force: bool, apply_funding: bool,
+                ext_force: "bool | None" = None):
+    """Single-H wrapper: fetch raw + build (kept for freeze / _score_now). evaluate fetches raw
+    ONCE via _fetch_raw and reuses _panel_from_raw across all H (no per-H re-fetch)."""
+    raw = _fetch_raw(days, source=source, force=force, ext_force=ext_force)
+    return _panel_from_raw(raw, H, apply_funding=apply_funding)
 
 
 def freeze() -> None:
@@ -200,13 +212,25 @@ def forward_verdict(net15: float, t15: float, net10: float, n_ts: int,
 def evaluate() -> None:
     FWD.mkdir(parents=True, exist_ok=True)
     now_ms = int(time.time() * 1000)
-    rows = []
-    for code, cfg in CANDIDATES.items():
+    # Gather frozen candidates first, then fetch the raw inputs ONCE at the longest lookback any
+    # candidate needs, and reuse across all H. The per-H forward window (settle filter below) is
+    # identical to fetching per-candidate, since features are causal and warmed up by official_start.
+    frozen = []
+    for code in CANDIDATES:
         d = FROZEN / code
         if not (d / "meta.json").exists():
             log(f"[{code}] not frozen yet — run --mode freeze first")
             continue
-        meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+        frozen.append((code, d, json.loads((d / "meta.json").read_text(encoding="utf-8"))))
+    if not frozen:
+        log("no frozen candidates — run --mode freeze first")
+        return
+    days_max = max(150 + int((now_ms - m["freeze_cutoff_ts"]) / 86_400_000) + 10 for _, _, m in frozen)
+    log(f"[evaluate {ASSET}] 一次性拉原始数据 days={days_max} (K线/外部源仅拉一次, {len(frozen)} 个周期复用)")
+    raw = _fetch_raw(days_max, source="refresh", force=True)
+
+    rows = []
+    for code, d, meta in frozen:
         H, bar_ms, tau = meta["H"], meta["bar_ms"], meta["tau"]
         cutoff, train_ic_sign = meta["freeze_cutoff_ts"], meta["ic_sign"]
         official_start = max(int(cutoff), int(meta.get("official_forward_start_ts", meta["frozen_at_ms"])))
@@ -217,8 +241,7 @@ def evaluate() -> None:
         med = pd.Series(json.loads((d / "median.json").read_text(encoding="utf-8")))
 
         # evaluate on the TRUE net target (taker + funding always folded in), only settled forward bars
-        days = 150 + int((now_ms - cutoff) / 86_400_000) + 10
-        panel, _ = build_panel(H, days=days, source="refresh", force=True, apply_funding=True)
+        panel, _ = _panel_from_raw(raw, H, apply_funding=True)
         for c in sel:                                   # tolerate a forward source that briefly drops a column
             if c not in panel.columns:
                 panel[c] = np.nan
