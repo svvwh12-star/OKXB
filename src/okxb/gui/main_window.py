@@ -824,6 +824,8 @@ class OKXBApp(ctk.CTk):
         self.multi_arm_btn = ctk.CTkButton(br, text="🎯 在模拟盘执行(demo)", font=FONT_B, width=170,
                                            fg_color=AMBER, command=lambda: self._multi_shadow(True))
         self.multi_arm_btn.pack(side="left", padx=4)
+        ctk.CTkButton(br, text="🤖 AI 解读对照", font=FONT_B, width=130, fg_color="#7a5cff",
+                      command=self._multi_ai_compare).pack(side="left", padx=4)
         ctk.CTkLabel(br, text="(demo 真下单: 顶部切『虚拟盘』+ 配 demo 密钥)",
                      font=("Microsoft YaHei UI", 11), text_color=GREY).pack(side="left", padx=6)
         self.multi_result = ctk.CTkTextbox(t, font=MONO)
@@ -897,6 +899,24 @@ class OKXBApp(ctk.CTk):
                 self._multi_busy = False
                 self.multi_arm_btn.configure(state="normal")
                 self._multi_refresh_now()
+            self.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _multi_ai_compare(self) -> None:
+        """把多周期量化结论喂给 AI 做只读对照解读 (AI 被硬约束: PENDING/KILL 不得说成机会)。"""
+        if self._multi_busy:
+            return
+        self._multi_busy = True
+        self.multi_arm_btn.configure(state="disabled")
+        self._multi_result_set("... AI 解读对照中 (跑一次当前打分 + AI 调用, 约 1-2 分钟) ...")
+
+        def work():
+            txt = multiperiod.ai_compare()
+
+            def done():
+                self._multi_result_set(txt)
+                self._multi_busy = False
+                self.multi_arm_btn.configure(state="normal")
             self.after(0, done)
         threading.Thread(target=work, daemon=True).start()
 

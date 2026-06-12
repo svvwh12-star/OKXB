@@ -349,6 +349,29 @@ class LLMClassifier:
         except Exception as e:
             return {"ok": False, "picks": [], "text": f"AI 选品失败: {e!r}"}
 
+    async def explain_quant_monitor(self, quant_text: str) -> str:
+        """对【多周期量化研究监控】结论做只读解读 + 标『AI vs 量化』差异。
+        铁律(写进 system): 这是只读研究监控; 除非 forward 状态=PASS, 否则候选一律不可交易;
+        绝不能把 PENDING/KILL 说成'有机会/可尝试/可入场'。不给交易建议, 只做对照解读。"""
+        if not self.enabled:
+            return ("未配置 AI (当前=规则或未填 key)。请到『账户与密钥』选 DeepSeek 填 Key 后再用。")
+        sysp = ("你是严谨的量化研究助理, 对一份『多周期量化研究监控』结论做解读。"
+                "【铁律】这是只读研究监控, 不是交易信号: 任何候选除非其 forward 状态=PASS, "
+                "否则一律【不可交易】; 你【绝对不得】把 PENDING 或 KILL 的候选描述成"
+                "'有机会/可以尝试/可入场/值得关注买卖'之类。你的唯一任务是解读与对照, 不给任何交易建议。"
+                "请输出三段, 每段加方括号小标题: "
+                "【量化客观结论】用一两句复述给定数据说明了什么(方向打分是否达 tau、forward 是否过门); "
+                "【AI 互补解读】给市场情境/波动regime/事件日历视角(不要重复方向预测, 给量化没覆盖的角度); "
+                "【AI vs 量化 差异】明确指出你的看法与量化测量哪里一致、哪里不同, 以及为何仍不可交易。"
+                "务必中文, 总字数<=320。")
+        user = (f"多周期量化结论(BTC 单品种, A/B/C 三个预登记候选):\n{quant_text}\n\n"
+                "请按上述三段输出。记住: 全 PENDING = 研究观察期, 不可交易; 不得给交易建议。")
+        try:
+            txt = await self._chat(self.model_hard, sysp, user, max_tokens=800)
+            return txt.strip() or "AI 未返回内容。"
+        except Exception as e:
+            return f"AI 解读失败: {e!r}"
+
     # ----------------- OpenAI 兼容 (DeepSeek 等) -----------------
 
     async def _classify_openai(self, model, ticker, text, kind, items) -> dict:
