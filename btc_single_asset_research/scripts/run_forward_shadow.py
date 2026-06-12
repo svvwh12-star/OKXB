@@ -80,13 +80,18 @@ def log(m: str) -> None:
     print(m, flush=True)
 
 
-def build_panel(H: int, *, days: int, source: str, force: bool, apply_funding: bool):
-    """Reproduce the enhanced pipeline (build_augmented_bank + funding-hold + enrich) for one H."""
+def build_panel(H: int, *, days: int, source: str, force: bool, apply_funding: bool,
+                ext_force: "bool | None" = None):
+    """Reproduce the enhanced pipeline (build_augmented_bank + funding-hold + enrich) for one H.
+    ext_force controls re-fetch of the daily external sources (rubik/DVOL/on-chain); defaults to
+    `force`. Live shadow scoring passes ext_force=False to reuse the daily cache (fast)."""
+    if ext_force is None:
+        ext_force = force
     btc = enh.load_candles("BTC-USDT-SWAP", BAR, days, source=source, force=force)
     spot = enh.load_candles("BTC-USDT", BAR, days, source=source, force=force)
     funding = cd.fetch_funding_series("BTC-USDT-SWAP", days + 5, log=log)
-    daily_external, _ = enh.fetch_daily_external(days, force=force)
-    short_external, _ = enh.fetch_short_intraday_external(force=force)
+    daily_external, _ = enh.fetch_daily_external(days, force=ext_force)
+    short_external, _ = enh.fetch_short_intraday_external(force=ext_force)
     perp = {"BTC-USDT-SWAP": btc}
     panel, bar_ms = pmw.build_augmented_bank(perp, {"BTC-USDT-SWAP": spot}, {"BTC-USDT-SWAP": funding}, BAR, H)
     if apply_funding:
@@ -267,7 +272,10 @@ def _score_now(code: str) -> dict:
     model, kind, scaler = blob["model"], blob["kind"], blob["scaler"]
     sel = json.loads((d / "feature_list.json").read_text(encoding="utf-8"))
     med = pd.Series(json.loads((d / "median.json").read_text(encoding="utf-8")))
-    panel, _ = build_panel(H, days=200, source="refresh", force=True, apply_funding=True)
+    # all-cache read: score direction on the most recent cached bar (5m bars lag anyway;
+    # the actual demo order, when --arm, uses the live ticker via the manual trade path).
+    # 30d lookback >> longest feature window (~3d for H=540) -> fast single-point scoring.
+    panel, _ = build_panel(H, days=30, source="refresh", force=False, apply_funding=True, ext_force=False)
     for c in sel:
         if c not in panel.columns:
             panel[c] = np.nan
@@ -277,7 +285,7 @@ def _score_now(code: str) -> dict:
     sc = float(pmw._score_from_model(kind, model, Xf)[0])
     dv = (float(last["btc_rv_1d_ann_pct"].iloc[0])
           if "btc_rv_1d_ann_pct" in last and pd.notna(last["btc_rv_1d_ann_pct"].iloc[0]) else 35.0)
-    cand = enh.load_candles("BTC-USDT-SWAP", BAR, 200, source="refresh", force=False)  # reuse cache build_panel just wrote
+    cand = enh.load_candles("BTC-USDT-SWAP", BAR, 30, source="refresh", force=False)  # reuse cache build_panel just wrote
     mid = float(cand["c"].iloc[-1]) if len(cand) else float("nan")
     return {"code": code, "H": H, "tau": tau, "score": sc, "tau_hit": abs(sc) >= tau,
             "side": "buy" if sc > 0 else "sell", "ts": int(last["ts"].iloc[0]), "daily_vol": dv, "mid": mid}
