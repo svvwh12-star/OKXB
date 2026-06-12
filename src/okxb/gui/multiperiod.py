@@ -34,6 +34,15 @@ def _fwd_dir(asset: str) -> Path:
     return base if asset == "btc" else base / asset
 
 
+def _subenv() -> dict:
+    """子进程环境: 注入 src 到 PYTHONPATH; 预设 LOKY_MAX_CPU_COUNT(必须在 python 启动【前】设好,
+    否则 loky 无 wmic 时会打印 [WinError 2] 探测噪音 —— 进程内再设来不及)。"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_root() / "src")
+    env.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 4))
+    return env
+
+
 def forward_status(asset: str = "btc") -> dict:
     """读 {asset} 的 forward_status.csv 最新一批(A/B/C) + shadow_trades 摘要。纯文件, 无需引擎/密钥。"""
     out: dict = {"ok": False, "rows": [], "shadow": [], "note": "", "asset": asset}
@@ -66,8 +75,7 @@ def shadow_run(armed: bool, asset: str = "btc") -> str:
     if not script.exists():
         return (f"未找到 {script}\n(多周期研究依赖 btc_single_asset_research/; "
                 "仅开发态或随附研究目录+python时可用)")
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(_root() / "src")
+    env = _subenv()
     cmd = ([sys.executable, str(script), "--asset", asset, "--mode", "shadow"]
            + (["--arm"] if armed else []))
     try:
@@ -93,8 +101,7 @@ def auto_step(live: bool, asset: str = "btc") -> str:
     script = _research() / "scripts" / "run_forward_shadow.py"
     if not script.exists():
         return (f"未找到 {script}\n(多周期自动交易依赖 btc_single_asset_research/; 仅开发态可用)")
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(_root() / "src")
+    env = _subenv()
     cmd = ([sys.executable, str(script), "--asset", asset, "--mode", "auto"]
            + (["--live"] if live else ["--arm"]))
     try:
@@ -130,8 +137,7 @@ def _get_snapshot(asset: str = "btc") -> dict:
     script = _research() / "scripts" / "run_forward_shadow.py"
     if not script.exists():
         return {}
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(_root() / "src")
+    env = _subenv()
     try:
         r = subprocess.run([sys.executable, str(script), "--asset", asset, "--mode", "snapshot"],
                            capture_output=True, text=True, timeout=300,

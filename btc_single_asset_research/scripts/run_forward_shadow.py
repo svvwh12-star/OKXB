@@ -16,13 +16,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# joblib/loky 在本机无 wmic 时探测物理核失败 -> 噪音 [WinError 2]。给定核数 + 兜底过滤该 warning。
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 4))
+warnings.filterwarnings("ignore", message="Could not find the number of physical cores")
 
 ROOT = Path(__file__).resolve().parents[2]               # OKXB
 SCRIPTS = Path(__file__).resolve().parent

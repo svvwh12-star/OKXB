@@ -7,6 +7,7 @@ $root   = "F:\临时\0609\OKXB"
 $py     = "C:\Python313\python.exe"
 $script = Join-Path $root "btc_single_asset_research\scripts\run_forward_shadow.py"
 $env:PYTHONPATH = Join-Path $root "src"
+$env:LOKY_MAX_CPU_COUNT = "$([Environment]::ProcessorCount)"   # 静默 loky 无wmic的探测噪音(须在python启动前设)
 $log    = Join-Path $root "btc_single_asset_research\forward\accrue.log"
 
 "`n===== run $(Get-Date -Format o) =====" | Out-File -Append -FilePath $log -Encoding utf8
