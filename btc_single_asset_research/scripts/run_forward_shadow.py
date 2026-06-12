@@ -56,15 +56,55 @@ SHADOW_ORD = "post_only"     # maker entry (measures real maker fill rate); 'mar
 SHADOW_STATE = FWD / "shadow_state.json"
 SHADOW_TRADES = FWD / "shadow_trades.csv"
 
-# ----- pre-registered, frozen candidate set (must match the committed protocol) -----
-# oos_ic_sign = the sign of the ORIGINAL OOS primary_ic (from enhanced_summary.csv), NOT the
-# in-sample fit (which is always +). The forward "same-sign" check compares against THIS.
-# C (9h) is pre-registered as -1: it is a falsification target (OOS IC was -0.0356).
-CANDIDATES = {
-    "A": {"H": 180, "model": "hist_gbm", "top_frac": 0.01, "oos_ic_sign": +1},
-    "B": {"H": 360, "model": "lightgbm", "top_frac": 0.02, "oos_ic_sign": +1},
-    "C": {"H": 540, "model": "mlp",      "top_frac": 0.05, "oos_ic_sign": -1},
+# ----- pre-registered, frozen candidate sets, PER ASSET (must match the committed protocol) -----
+# oos_ic_sign = the sign of the ORIGINAL OOS primary_ic (from {asset}_enhanced_summary.csv), NOT
+# the in-sample fit. The forward "same-sign" check compares against THIS.
+# BTC: C(9h) pre-registered as -1 (falsification target, OOS IC -0.0356).
+# ETH (added 2026-06-12, from data/eth_enhanced_summary.csv; ALL gate=False / NO TRADE in-sample,
+#      same as BTC — the forward test is the honest registration, expected to stay PENDING):
+#   A H=180 rf_ret   top0.10  primary_ic=-0.0030 -> -1
+#   B H=360 logit_l2 top0.005 primary_ic=+0.0476 -> +1
+#   C H=540 hist_gbm top0.02  primary_ic=-0.0070 -> -1
+ASSET_CFG = {
+    "btc": {
+        "perp": "BTC-USDT-SWAP", "spot": "BTC-USDT",
+        "candidates": {
+            "A": {"H": 180, "model": "hist_gbm", "top_frac": 0.01, "oos_ic_sign": +1},
+            "B": {"H": 360, "model": "lightgbm", "top_frac": 0.02, "oos_ic_sign": +1},
+            "C": {"H": 540, "model": "mlp",      "top_frac": 0.05, "oos_ic_sign": -1},
+        },
+    },
+    "eth": {
+        "perp": "ETH-USDT-SWAP", "spot": "ETH-USDT",
+        "candidates": {
+            "A": {"H": 180, "model": "rf_ret",   "top_frac": 0.1,   "oos_ic_sign": -1},
+            "B": {"H": 360, "model": "logit_l2", "top_frac": 0.005, "oos_ic_sign": +1},
+            "C": {"H": 540, "model": "hist_gbm", "top_frac": 0.02,  "oos_ic_sign": -1},
+        },
+    },
 }
+ASSET = "btc"
+CANDIDATES = ASSET_CFG["btc"]["candidates"]
+PERP, SPOT = ASSET_CFG["btc"]["perp"], ASSET_CFG["btc"]["spot"]
+
+
+def _set_asset(asset: str) -> None:
+    """Point module globals at one asset's frozen/forward dirs + candidate set.
+    btc keeps the ORIGINAL unprefixed dirs (preserves the running BTC forward test);
+    other assets nest under frozen/{asset} and forward/{asset}."""
+    global ASSET, CANDIDATES, PERP, SPOT, FROZEN, FWD, SHADOW_STATE, SHADOW_TRADES
+    if asset not in ASSET_CFG:
+        raise SystemExit(f"unknown asset {asset!r}; choices: {list(ASSET_CFG)}")
+    ASSET = asset
+    cfg = ASSET_CFG[asset]
+    CANDIDATES = cfg["candidates"]
+    PERP, SPOT = cfg["perp"], cfg["spot"]
+    FROZEN = (OUT / "frozen") if asset == "btc" else (OUT / "frozen" / asset)
+    FWD = (OUT / "forward") if asset == "btc" else (OUT / "forward" / asset)
+    SHADOW_STATE = FWD / "shadow_state.json"          # per-asset single-slot state
+    SHADOW_TRADES = FWD / "shadow_trades.csv"
+
+
 BAR = "5m"
 K_SEL = 30
 PRESET = "deep"
@@ -87,13 +127,13 @@ def build_panel(H: int, *, days: int, source: str, force: bool, apply_funding: b
     `force`. Live shadow scoring passes ext_force=False to reuse the daily cache (fast)."""
     if ext_force is None:
         ext_force = force
-    btc = enh.load_candles("BTC-USDT-SWAP", BAR, days, source=source, force=force)
-    spot = enh.load_candles("BTC-USDT", BAR, days, source=source, force=force)
-    funding = cd.fetch_funding_series("BTC-USDT-SWAP", days + 5, log=log)
-    daily_external, _ = enh.fetch_daily_external(days, force=ext_force)
-    short_external, _ = enh.fetch_short_intraday_external(force=ext_force)
-    perp = {"BTC-USDT-SWAP": btc}
-    panel, bar_ms = pmw.build_augmented_bank(perp, {"BTC-USDT-SWAP": spot}, {"BTC-USDT-SWAP": funding}, BAR, H)
+    btc = enh.load_candles(PERP, BAR, days, source=source, force=force)
+    spot = enh.load_candles(SPOT, BAR, days, source=source, force=force)
+    funding = cd.fetch_funding_series(PERP, days + 5, log=log)
+    daily_external, _ = enh.fetch_daily_external(days, force=ext_force, asset=ASSET)
+    short_external, _ = enh.fetch_short_intraday_external(force=ext_force, asset=ASSET)
+    perp = {PERP: btc}
+    panel, bar_ms = pmw.build_augmented_bank(perp, {PERP: spot}, {PERP: funding}, BAR, H)
     if apply_funding:
         panel = enh.apply_funding_hold_cost(panel, funding, H)
     panel = enh.enrich_panel(panel, btc, BAR, daily_external, short_external, include_short=False)
@@ -317,7 +357,7 @@ def _score_now(code: str) -> dict:
     sc = float(pmw._score_from_model(kind, model, Xf)[0])
     dv = (float(last["btc_rv_1d_ann_pct"].iloc[0])
           if "btc_rv_1d_ann_pct" in last and pd.notna(last["btc_rv_1d_ann_pct"].iloc[0]) else 35.0)
-    cand = enh.load_candles("BTC-USDT-SWAP", BAR, 30, source="refresh", force=False)  # reuse cache build_panel just wrote
+    cand = enh.load_candles(PERP, BAR, 30, source="refresh", force=False)  # reuse cache build_panel just wrote
     mid = float(cand["c"].iloc[-1]) if len(cand) else float("nan")
 
     def _g(col):                                    # human-readable OBJECTIVE factor (no model output)
@@ -327,7 +367,7 @@ def _score_now(code: str) -> dict:
         except Exception:  # noqa: BLE001
             return None
     feat = {k: v for k, v in {
-        "BTC现价": round(mid, 1) if np.isfinite(mid) else None,
+        f"{PERP.split('-')[0]}现价": round(mid, 1) if np.isfinite(mid) else None,
         "近端动量roc": _g("roc"),
         "1日年化已实现波动%": round(dv, 1) if np.isfinite(dv) else None,
         "DVOL隐含波动": _g("dvol_daily"),
@@ -366,7 +406,7 @@ def shadow(armed: bool = False, live: bool = False) -> None:
         log(err)
         return
     place = armed or live
-    inst = "BTC-USDT-SWAP"
+    inst = PERP
     now = int(time.time() * 1000)
     st = json.loads(SHADOW_STATE.read_text(encoding="utf-8")) if SHADOW_STATE.exists() else None
 
@@ -489,11 +529,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Forward shadow test (pre-registered).")
     ap.add_argument("--mode", choices=["freeze", "evaluate", "selftest", "shadow", "snapshot", "auto"],
                     required=True)
+    ap.add_argument("--asset", default="btc", choices=list(ASSET_CFG.keys()),
+                    help="标的: btc(默认) 或 eth。各资产独立的 frozen/forward 目录与候选集。")
     ap.add_argument("--arm", action="store_true",
                     help="shadow/auto 下真在 demo 下单 (默认 dry-run: 只显示决策, 不下单)")
     ap.add_argument("--live", action="store_true",
                     help="实盘下单, 仅对 forward verdict=PASS 的候选 (需 OKXB_MODE=live); 全 PENDING 则不下单")
     args = ap.parse_args()
+    _set_asset(args.asset)
     if args.mode == "shadow":
         shadow(armed=args.arm, live=args.live)
     elif args.mode == "auto":
