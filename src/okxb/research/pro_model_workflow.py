@@ -53,6 +53,26 @@ class WorkflowCosts:
     taker_bps: float = 10.0
     stress_bps: float = 15.0
 
+    @classmethod
+    def from_config(cls, cfg) -> "WorkflowCosts":
+        """Round-trip costs (bps) from config fee percents, with the live fee-rebate
+        applied to the FEE component only (not slippage). config crypto_*_pct are
+        one-side percents (0.02 -> 2 bps one side -> 4 bps round trip)."""
+        def g(key: str, default: float) -> float:
+            try:
+                v = cfg.get(key, default)
+                return float(default if v is None else v)
+            except Exception:  # noqa: BLE001
+                return default
+        maker1 = g("fees.crypto_maker_pct", 0.02)
+        taker1 = g("fees.crypto_taker_pct", 0.05)
+        rebate = min(max(g("fees.fee_rebate_frac", 0.0), 0.0), 0.9)
+        return cls(
+            maker_bps=round(maker1 * 200.0 * (1.0 - rebate), 3),   # %->bps (x100), one side->round trip (x2)
+            taker_bps=round(taker1 * 200.0 * (1.0 - rebate), 3),
+            stress_bps=round(taker1 * 300.0, 3),                   # 1.5x round-trip taker, no rebate (slippage-led)
+        )
+
 
 def _safe_z(s: pd.Series, win: int) -> pd.Series:
     r = s.rolling(win)

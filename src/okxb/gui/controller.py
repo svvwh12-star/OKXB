@@ -777,8 +777,9 @@ async def _quant_context(inst_id: str, row: dict) -> dict:
 
     atr = row.get("atr")
     fees = cfg.section("fees")
-    # 往返成本: maker入+taker出+半价差+滑点 (保守按可能吃单估)
-    cost = (float(fees.get("crypto_maker_pct", 0.02)) + float(fees.get("crypto_taker_pct", 0.05))) / 100.0
+    rebate = min(max(float(cfg.get("fees.fee_rebate_frac", 0.0) or 0.0), 0.0), 0.9)
+    # 往返成本: (maker入+taker出)手续费×(1−返点) + 半价差 + 滑点 (后两者不返点)
+    cost = (float(fees.get("crypto_maker_pct", 0.02)) + float(fees.get("crypto_taker_pct", 0.05))) / 100.0 * (1.0 - rebate)
     cost += (float(row.get("spread_bps") or 5.0) / 1e4) * 0.5 + 0.0003
     # 止损必须留出成本以上的空间, 否则一点噪声就被扫出、白交手续费 (cost-aware floor)
     sl_cost_mult = float(cfg.get("signal.sl_min_cost_mult", 2.5))
