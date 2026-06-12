@@ -1,51 +1,44 @@
-# App 多周期量化集成 实现计划(分阶段)
+# App 多周期量化集成 实现计划(安全版 · 已按方法论审查修正 2026-06-12)
 
-> 把多周期量化(15/30/60/120/180/360/720min)接进 OKXB .exe(tkinter GUI),**替换控制台方向源**、
-> **严格亮灯**、**AI 对照**、**20% 返点费率**。
-> **诚实定位(已与用户确认):监控/对照面板,不是"亮灯就下单"的信号灯。** 亮灯门用真实净edge闸门,多数时间会是"未达标/NO TRADE"——那是真话。
+> **本计划已根据一组方法论批评全面修正。定位红线(不可逾越):**
+> **App 内部「只读研究监控面板」——不接交易执行、不替换方向源、不驱动下单、不改 forward 判据。**
+> 旧版"替换控制台方向源 + 历史gate亮灯 + 扩7周期"的写法已作废(会破坏预登记、把噪声摆成信号)。
 
-## 架构(数据流)
-```
-冻结模型(forward shadow frozen, 扩到7周期)
-        │  定时(10-15min)+手动 触发
- MultiPeriodSignal 服务(轻量推断: 当前方向分 + 历史OOS净edge[返点后] + gate + 亮灯)
-        │  写
- App.latest_multiperiod = {inst: {H: {dir, score, net_bps, gate, light}}}
-        │  读
- 控制台(周期切换 15-720 + long/short 源替换 + 亮灯列)
-        │
- AI 分析(_quant_context dir_prior 用多周期 + analyze prompt 加量化结论并标"AI vs 量化"差异)
-```
-现实约束:DVOL/链上只有 BTC/ETH 全;OKX rubik OI/taker 多为近窗。**多周期对 BTC(其次 ETH)最完整**,其他标的退化为基础价量+funding+cross-asset。
+## 不可逾越的边界(全部来自方法论审查,逐条采纳)
+1. **预登记保护**:forward 裁决**永远只用冻结的 A/B/C**(180min hist_gbm / 6h lightgbm / 9h mlp)。任何新周期(15/30/60/120/720)需**另开一个全新预登记实验**(新 freeze/cutoff/6周),不混进本面板。
+2. **返点只作参考,不改判据**:面板显示两列 `conservative_net`(taker10,不返点,**主**)与 `rebate_net`(taker8,仅参考)。亮灯/裁决一律用 `conservative_net` + forward 状态。**forward 协议判据(taker10+funding+1.5x stress)不变。** 返点只让数字好看 ~2bps,**不改 verdict**(病因是 t<门槛+n太少,不是成本)。
+3. **不替换方向源**:控制台原超高频方向源**保留不动**;多周期是**独立只读 tab**,不喂交易默认方向、不进选品排序、不碰下单。
+4. **亮灯由 forward 状态驱动**(非历史 OOS gate):`PASS→绿`(仅代表进第二阶段,非实盘)/`PENDING→黄灰`/`KILL→红`/`历史好看但forward未过→灰`。**现状 A/B/C 全 PENDING ⇒ 面板不得有任何绿色交易灯。**
+5. **AI 只解释**:prompt 硬约束 `monitor-only unless forward PASS`、`AI MUST NOT recommend a trade when gate is PENDING/KILL`;输出须含"AI 说法 vs 量化测量"差异行。
+6. **先只 BTC、只 A/B/C 三个冻结候选**。其他标的/周期不上实时面板。
 
-## Phase A — 返点费率(本轮落地;小、独立、是一切净edge的基础)
-- `config/config.yaml` `fees` 段加 `fee_rebate_frac: 0.20`。
-- `pmw.WorkflowCosts.from_config(cfg)`:读 maker/taker_pct,乘 `(1−rebate)`,转 bps。
-- 多周期/forward/vol_carry 的成本都走返点后 `WorkflowCosts`;controller `_quant_context` 的 `cost` 乘 `(1−rebate)`。
-- **验收**:单测 `WorkflowCosts.from_config` 返点计算;手动确认 AI 分析里的 cost 反映返点。
-- **诚实**:返点把 taker 往返 ~10→8bps,**不改变"这些信号是噪声"的结论**。
+## Phase 0 — 边界修正(本文件即是)✅
+把定位钉死为"只读监控,不接执行/不替换方向源"。
 
-## Phase B — 多周期信号服务(BTC 先行)
-- 扩展 `run_forward_shadow.py` 的 freeze 到 **7 个周期**(各周期从已有研究选最佳模型/top_frac);或新建 `multiperiod_freeze`。
-- 新模块 `src/okxb/signal/multiperiod.py`:`MultiPeriodSignal.infer(inst)` → `{H: {dir, score, net_bps(返点后), gate, light}}`,用冻结模型对**当前 bar** 打分,net_bps/gate 取该候选**历史 OOS**值,亮灯门=严格(gate pass→绿;接近→黄;否则灰)。
-- **验收**:脚本对 BTC 输出 7 周期表;绿灯仅当真过闸门。
+## Phase 1 — Forward 状态面板(读 `forward_status.csv`)
+- 新 tab「多周期研究监控」。读 `btc_single_asset_research/forward/forward_status.csv`,显示每个候选:
+  `候选 A/B/C | H | 模型 | start_utc | weeks | n_ts | net10/net15(conservative) | fwd_ic | verdict`。
+- 顶部横幅:`A/B/C 全 PENDING — 研究观察期, 不可交易`。
+- **验收**:无引擎也能看(纯读 CSV);verdict 着色按边界④;现状无绿灯。
 
-## Phase C — App 集成(定时+手动刷新)
-- `App` 加后台 `asyncio` 任务:每 `multiperiod.refresh_seconds`(默认 900)跑一次 `MultiPeriodSignal`,写 `self.latest_multiperiod`;暴露 `request_multiperiod_refresh()` 供手动触发。
-- `EngineController.multiperiod()` 只读访问 + `refresh_multiperiod_sync()`。
-- **验收**:引擎跑起来后 `latest_multiperiod` 定时更新;手动按钮即时刷新。
+## Phase 2 — 当前打分面板(A/B/C frozen 对当前 bar 打分)
+- 加载 `frozen/{A,B,C}` 模型,对**当前** 5m bar 用冻结管线打分,只显示:
+  `当前方向倾向 | score | 是否超过冻结 tau(高置信) | 该候选是否已 PASS`。
+- 两列净edge参考:`conservative_net`(主) + `rebate_net`(灰字"参考")。
+- 无 PASS 时整行标注「**研究观察,不可交易**」。手动/定时刷新(多周期算几秒,定时默认 900s + 手动按钮)。
+- **验收**:打分只读;无 PASS 不给任何"可做"暗示;tau 用冻结绝对值。
 
-## Phase D — 控制台 GUI(替换方向源 + 周期切换 + 亮灯)
-- 控制台加 `CTkSegmentedButton` 周期切换(15/30/60/120/180/360/720)+ "↻刷新多周期"按钮。
-- 选中周期后,表格 `long/short` 用 `latest_multiperiod[inst][H]` 的方向分(替换超高频源);新增"亮灯"列(绿/黄/灰)+ "净edge"列。
-- 表头/排序适配新列。
-- **验收**:切换周期表格随之变;亮灯严格;无引擎时显示"未就绪"。
+## Phase 3 — AI 对照(只解释,不荐交易)
+- 把 A/B/C 的「方向/score/conservative_net/forward verdict」喂给 `analyze_structured`,prompt 硬约束(边界⑤)。
+- AI 输出:量化客观结论段 + AI 互补解读段(事件/regime/情境) + "AI vs 量化差异"行。`verdict≠PASS` 时 AI 不得给任何"可尝试"措辞。
+- **验收**:对 PENDING 候选,AI 输出里无交易建议;有差异行。
 
-## Phase E — AI 对照(量化喂给 AI + 标差异)
-- `_quant_context` 的 `dir_prior` 改用当前选中周期的多周期方向;加入该周期 `net_bps/gate`。
-- `LLMClassifier.analyze_structured` prompt 注入"多周期量化结论",要求 AI 给**互补**的事件/regime/情境解读(不重复方向),并显式输出"AI 说法 vs 量化测量"的差异行。
-- 验证 DeepSeek/Finnhub key 接通(已有 `verify_ai_sync`/`verify_finnhub_sync`)。
-- **验收**:AI 分析输出含"量化:方向/净edge/gate"与"AI:互补解读+差异"两段。
+## Phase 4 — 仅当 PASS 后(6 周判定后)
+- 只有某候选 forward **PASS**,才进第二阶段:全新独立 forward 窗 + 最小真钱测成交质量(接 raw L2)。**本面板永不直接下单。**
 
-## 阶段闸门
-每阶段独立可验收;Phase A→B→C→D→E 顺序;A 本轮完成,B 起逐轮推进。亮灯严格门是贯穿红线:**只有真过净edge闸门才绿灯**。
+## 已完成的 Phase A(返点)如何归位
+Phase A(`fee_rebate_frac` + `WorkflowCosts.from_config` + GUI cost 返点)**保留**,但用途收窄为:**UI 的 `rebate_net` 参考列 + AI 分析的成本展示**。`run_forward_shadow.py` 的判据仍硬编码 taker10/stress15(未受影响),**forward 裁决不返点**。
+
+## 明确被否决(不做)
+- ❌ 7 周期实时信号面板(破坏预登记/盯噪声)——7周期历史看静态 `enhanced_summary.csv`。
+- ❌ 替换控制台方向源。❌ 历史 OOS gate 亮灯。❌ 亮灯/面板驱动下单。❌ 返点改 forward 判据。❌ 多标的同时上。
