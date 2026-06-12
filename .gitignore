@@ -44,3 +44,9 @@ models/*.bin
 Thumbs.db
 .vscode/
 .idea/
+
+# btc_single_asset_research: track scripts only, never data/artifacts
+btc_single_asset_research/frozen/
+btc_single_asset_research/forward/
+btc_single_asset_research/raw_l2/
+btc_single_asset_research/reports/
