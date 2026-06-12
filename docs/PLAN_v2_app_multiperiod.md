@@ -36,6 +36,15 @@
 ## Phase 4 — 仅当 PASS 后(6 周判定后)
 - 只有某候选 forward **PASS**,才进第二阶段:全新独立 forward 窗 + 最小真钱测成交质量(接 raw L2)。**本面板永不直接下单。**
 
+## Phase S — demo 影子执行验证轨道(仅 demo,与监控面板分离)
+> 这是用户要求的"模拟盘自动下单",作为一条**独立轨道**。与"只读监控面板"不矛盾:监控面板永不下单;本轨道**仅 demo**自动下单,目的是**执行真实性验证**,不碰真钱、不替换方向源、不影响纸面裁决。
+- **目的(已确认):执行真实性验证**——量出"纸面 net vs 真实成交 net"差距(成交率/滑点/延迟/funding/止盈止损触发)。**非盈利目的;诚实预期 demo 亏/打平**(信号 gate=False);demo 盈不代表可上实盘。
+- 护栏:**仅 demo,fail-closed**(`guard_demo`:非 demo 拒绝);**串行单槽**(任一时刻 BTC≤1 影子仓,A/B/C 谁先超 tau 谁入场);风险预算反推(equity×0.3%,杠杆钳 1-10);bracket = TP/SL(k×日级波动)+ 到该候选 H 的 **time-exit**;平仓 reduce-only。
+- 默认 **dry-run**(`--mode shadow`:纯公共数据,只显示"会怎么动作",**不下单**);**`--arm`** 才在 demo 真下单(需 `OKXB_MODE=demo` + demo 密钥)。
+- 记录 `forward/shadow_trades.csv`(执行层,独立于纸面 `forward_status.csv`);**不进 forward 统计裁决**。
+- 命令:`python run_forward_shadow.py --mode shadow`(dry) / `... --mode shadow --arm`(demo 下单)。
+- 已实现:`run_forward_shadow.py` 的 `shadow()` + 纯逻辑(`guard_demo`/`shadow_size`/`tp_sl_pct`/`_score_now`),selftest 覆盖纯逻辑;真下单/对账细节待你配 demo key 后实测迭代。
+
 ## 已完成的 Phase A(返点)如何归位
 Phase A(`fee_rebate_frac` + `WorkflowCosts.from_config` + GUI cost 返点)**保留**,但用途收窄为:**UI 的 `rebate_net` 参考列 + AI 分析的成本展示**。`run_forward_shadow.py` 的判据仍硬编码 taker10/stress15(未受影响),**forward 裁决不返点**。
 
