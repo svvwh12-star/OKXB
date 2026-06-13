@@ -12,8 +12,9 @@ evaluate: 复用冻结件(不refit/不重选), 只评 official_forward_start 之
           net of taker + x1.5 应力, 检 PASS/KILL/PENDING(与加密同协议)。
 snapshot: 当前打分(监控)。
 
-注: OKX 股票永续仅~100天历史保留。本前向在冻结后约90天内, 滚动100天窗口可覆盖前向期;
-   若要跑满 N_MIN=50 信号/超过90天, 需另加"前向观测持久化"(后续可补)。
+前向观测持久化: evaluate 把【已结算且过tau】的观测 (ts,inst,score,fwd) 增量写入
+   forward/ST720_obs.csv(按 ts+inst 去重、不可变), 裁决从【全部累积观测】算 ->
+   跨 OKX ~100天保留期【无限期累积】(只要每 <90 天至少评估一次, 就不丢任何已结算bar)。
 """
 from __future__ import annotations
 
@@ -154,6 +155,8 @@ def evaluate() -> None:
     row = {"asof_utc": pd.to_datetime(now, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M"),
            "code": CANDIDATE["code"], "H": H, "weeks": round(weeks, 2), "n_signals": 0,
            "n_ts": 0, "verdict": "PENDING", "start_utc": pd.to_datetime(official_start, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M")}
+    # 1) 当前窗口内【已结算且过tau】的观测 (ts,inst,score,fwd)
+    new_obs = pd.DataFrame(columns=["ts", "inst", "score", "fwd"])
     if len(panel):
         for c in sel:
             if c not in panel.columns:
@@ -164,25 +167,41 @@ def evaluate() -> None:
         if len(sub):
             X = sub[sel].fillna(med).values
             Xf = scaler.transform(X) if scaler is not None else X
-            score = pmw._score_from_model(kind, model, Xf)
-            hi = sub.assign(score=score)
-            hi = hi[np.abs(hi["score"].values) >= tau]
-            h = max(1, round(H / (bar_ms / 60_000)))
-            reb = set(cr._rebalance_ts(np.sort(hi["ts"].unique()), bar_ms, h).tolist())
-            tr = hi[hi["ts"].isin(reb)]
-            if len(tr):
-                signed = np.sign(tr["score"].values) * tr["fwd"].values
-                port = pd.Series(signed, index=tr["ts"].values).groupby(level=0).mean().values
-                net10, t10 = _net(port, TAKER_BPS)
-                net15, t15 = _net(port, TAKER_BPS * STRESS_MULT)
-                fic = cr._spearman(tr["score"].values, tr["fwd"].values) if len(tr) > 5 else 0.0
-                fic_sign = int(np.sign(fic or 0.0))
-                verdict = forward_verdict(net15, t15, net10, len(port), fic_sign, train_ic_sign, weeks)
-                row.update({"n_signals": len(tr), "n_ts": len(port),
-                            "net10_bps": round(net10, 1), "t10": round(t10, 2),
-                            "net15_bps": round(net15, 1), "t15": round(t15, 2),
-                            "fwd_ic": round(float(fic), 4), "fwd_ic_sign": fic_sign,
-                            "train_ic_sign": train_ic_sign, "verdict": verdict})
+            sub = sub.assign(score=pmw._score_from_model(kind, model, Xf))
+            new_obs = sub.loc[np.abs(sub["score"].values) >= tau, ["ts", "inst", "score", "fwd"]].copy()
+    # 2) 合并到【持久化观测库】(去重 ts+inst, 留旧 -> 前向记录不可变), 存盘。
+    #    已结算bar的 (score,fwd) 是定值; 一旦记下即永久, 不再受滚动窗口/OKX~100天保留期限制。
+    obs_path = FWD / "ST720_obs.csv"
+    if obs_path.exists():
+        try:
+            old = pd.read_csv(obs_path)
+        except Exception:  # noqa: BLE001
+            old = pd.DataFrame(columns=["ts", "inst", "score", "fwd"])
+        allobs = pd.concat([old, new_obs], ignore_index=True)
+    else:
+        allobs = new_obs
+    if len(allobs):
+        allobs["ts"] = allobs["ts"].astype("int64")
+        allobs = allobs.drop_duplicates(["ts", "inst"], keep="first").sort_values("ts").reset_index(drop=True)
+        allobs.to_csv(obs_path, index=False)
+    # 3) 裁决从【全部累积观测】算(净edge闸门), 不只看当前窗口
+    if len(allobs):
+        h = max(1, round(H / (bar_ms / 60_000)))
+        reb = set(cr._rebalance_ts(np.sort(allobs["ts"].unique()), bar_ms, h).tolist())
+        tr = allobs[allobs["ts"].isin(reb)]
+        if len(tr):
+            signed = np.sign(tr["score"].values) * tr["fwd"].values
+            port = pd.Series(signed, index=tr["ts"].values).groupby(level=0).mean().values
+            net10, t10 = _net(port, TAKER_BPS)
+            net15, t15 = _net(port, TAKER_BPS * STRESS_MULT)
+            fic = cr._spearman(tr["score"].values, tr["fwd"].values) if len(tr) > 5 else 0.0
+            fic_sign = int(np.sign(fic or 0.0))
+            verdict = forward_verdict(net15, t15, net10, len(port), fic_sign, train_ic_sign, weeks)
+            row.update({"n_signals": len(tr), "n_ts": len(port),
+                        "net10_bps": round(net10, 1), "t10": round(t10, 2),
+                        "net15_bps": round(net15, 1), "t15": round(t15, 2),
+                        "fwd_ic": round(float(fic), 4), "fwd_ic_sign": fic_sign,
+                        "train_ic_sign": train_ic_sign, "verdict": verdict})
     hist = FWD / "stock_forward_status.csv"
     df = pd.DataFrame([row])
     if hist.exists():
@@ -192,7 +211,7 @@ def evaluate() -> None:
         except Exception:  # noqa: BLE001
             hist.replace(FWD / f"stock_forward_status_archived_{int(time.time())}.csv")
     df.to_csv(hist, mode="a", header=not hist.exists(), index=False)
-    log(f"[{CANDIDATE['code']}] H={H} weeks={weeks:.1f} n_ts={row.get('n_ts')} "
+    log(f"[{CANDIDATE['code']}] H={H} weeks={weeks:.1f} 累积观测={len(allobs)} n_ts={row.get('n_ts')} "
         f"net10={row.get('net10_bps', '-')}(t{row.get('t10', '-')}) "
         f"net15={row.get('net15_bps', '-')}(t{row.get('t15', '-')}) "
         f"fwd_ic={row.get('fwd_ic', '-')} -> {row['verdict']}")
