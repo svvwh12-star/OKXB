@@ -93,9 +93,9 @@ def build_calendar_panel(symbol: str, df: pd.DataFrame, H: int, bar_ms: int) -> 
     return out
 
 
-def _gate_for_H(panel: pd.DataFrame, H: int, bar_ms: int, preset: str, costs) -> dict:
+def _gate_for_H(panel: pd.DataFrame, H: int, bar_ms: int, preset: str, costs, n_folds: int = 4) -> dict:
     feats = pmw.feature_cols(panel)
-    comp = pmw.purged_model_compare(panel, feats, H, bar_ms, n_folds=4, k_sel=12,
+    comp = pmw.purged_model_compare(panel, feats, H, bar_ms, n_folds=n_folds, k_sel=12,
                                     min_train=4500, preset=preset, log=log)
     if comp.get("error"):
         return {"error": comp["error"]}
@@ -120,14 +120,20 @@ def _gate_for_H(panel: pd.DataFrame, H: int, bar_ms: int, preset: str, costs) ->
         if best is None or (cand["gate"], cand.get("net10") or -1e9) > (best["gate"], best.get("net10") or -1e9):
             best = cand
             best_odf = odf
-    # 稳健性: best 模型的【逐标的】样本外 IC —— 边际是广谱还是被单只带动?
-    per_sym = {}
+    # 稳健性: best 模型的【逐标的】OOS-IC(广谱?) + 【前后半段】OOS-IC(跨时间持续?)
+    per_sym, half = {}, {}
     if best_odf is not None and len(best_odf):
         cl = best_odf.replace([np.inf, -np.inf], np.nan).dropna(subset=["score", "fwd"])
         for inst, g in cl.groupby("inst"):
             ic = cr._spearman(g["score"].values, g["fwd"].values) if len(g) > 30 else float("nan")
             per_sym[str(inst).split("-")[0]] = (round(float(ic), 4), len(g))
-    return {"best": best, "all": rows, "selected_freq": comp["selected_freq"][:12], "per_sym": per_sym}
+        if len(cl) > 200:
+            med = cl["ts"].median()
+            for lab, g in (("前半", cl[cl["ts"] <= med]), ("后半", cl[cl["ts"] > med])):
+                ic = cr._spearman(g["score"].values, g["fwd"].values) if len(g) > 50 else float("nan")
+                half[lab] = (round(float(ic), 4), len(g))
+    return {"best": best, "all": rows, "selected_freq": comp["selected_freq"][:12],
+            "per_sym": per_sym, "half": half}
 
 
 def run(days: int, preset: str, force: bool) -> None:
@@ -187,13 +193,62 @@ def run(days: int, preset: str, force: bool) -> None:
     print("\n" + report)
 
 
+def robust(days: int, preset: str) -> None:
+    """预登记稳健性电池(一次跑完, 读总体, 不迭代调到过): 全样本/去SOXL/折数6/复现 × 逐标的+前后半 IC。"""
+    bar_ms = cd.BAR_MS[BAR]
+    log("[robust] 载入(纯缓存, 不增量 -> 可复现) ...")
+    candles = {}
+    for s in SYMBOLS:
+        df = cd.get_candles(s, BAR, days, DATA / "candles", force=False, update=False, log=log)
+        if len(df) > 500:
+            candles[s] = df
+    costs = pmw.WorkflowCosts()
+    out = ["=" * 88, "股票日历 候选 稳健性检验 (预登记电池; EXPLORATORY; ~100天低置信)", "=" * 88,
+           "读法: gate=True 且 4只逐标的IC全正 且 前后半IC都正 且 复现一致 -> 才值得 freeze+forward。"]
+
+    def _one(tag: str, syms: list, H: int, n_folds: int) -> dict:
+        panel = pd.concat([build_calendar_panel(s, candles[s], H, bar_ms) for s in syms if s in candles],
+                          ignore_index=True)
+        res = _gate_for_H(panel, H, bar_ms, preset, costs, n_folds=n_folds)
+        b = res.get("best") or {}
+        if not b:
+            out.append(f"[{tag:6}] H={H}: 无有效模型"); return res
+        ps = "  ".join(f"{k}{v[0]:+.3f}" for k, v in res.get("per_sym", {}).items())
+        hf = "  ".join(f"{k}{v[0]:+.3f}(n{v[1]})" for k, v in res.get("half", {}).items())
+        out.append(f"[{tag:6}] H={H} {b['model']:9} gate={str(b['gate']):5} ic={b['primary_ic']:+.4f} "
+                   f"auc={b['auc']:.3f} net10={b.get('net10')}bps(t{b.get('t10')}) n_ts={b.get('n_ts')}")
+        out.append(f"          逐标的IC: {ps}")
+        out.append(f"          前后半IC: {hf}   <- 两段都正才算跨时间稳")
+        return res
+
+    for H in HORIZONS:
+        out.append(f"\n--- H={H}min ---")
+        r1 = _one("全样本", SYMBOLS, H, 4)
+        _one("去SOXL", ["MU-USDT-SWAP", "NVDA-USDT-SWAP", "TSLA-USDT-SWAP"], H, 4)
+        _one("折数6", SYMBOLS, H, 6)
+        r2 = _one("复现", SYMBOLS, H, 4)
+        b1, b2 = (r1.get("best") or {}), (r2.get("best") or {})
+        same = (round(b1.get("primary_ic", -9), 4) == round(b2.get("primary_ic", -9), 4)
+                and b1.get("n_ts") == b2.get("n_ts"))
+        out.append(f"          确定性(纯缓存两跑一致?): {'是' if same else '否 -> 仍有非确定性, freeze前须消除'}")
+    out.append("=" * 88)
+    rep = "\n".join(out)
+    REPORTS.mkdir(parents=True, exist_ok=True)
+    (REPORTS / "stock_calendar_robust.txt").write_text(rep, encoding="utf-8")
+    print("\n" + rep)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="US-stock-perp 日内日历结构 试点研究。")
     ap.add_argument("--days", type=int, default=100)
     ap.add_argument("--preset", default="deep", choices=["fast", "deep"])
     ap.add_argument("--force", action="store_true", help="强制全量重拉K线(默认增量/缓存)")
+    ap.add_argument("--robust", action="store_true", help="跑预登记稳健性电池(全样本/去SOXL/折6/复现+前后半IC)")
     args = ap.parse_args()
-    run(args.days, args.preset, args.force)
+    if args.robust:
+        robust(args.days, args.preset)
+    else:
+        run(args.days, args.preset, args.force)
 
 
 if __name__ == "__main__":
