@@ -313,6 +313,81 @@ def generalize() -> None:
     print("\n" + rep)
 
 
+POOLS = {
+    "半导体OOS": ["AMD-USDT-SWAP", "MRVL-USDT-SWAP", "INTC-USDT-SWAP", "AVGO-USDT-SWAP"],
+    "指数OOS": ["SPY-USDT-SWAP", "QQQ-USDT-SWAP"],
+    "巨头OOS": ["AAPL-USDT-SWAP", "MSFT-USDT-SWAP", "GOOGL-USDT-SWAP", "AMZN-USDT-SWAP", "META-USDT-SWAP", "NFLX-USDT-SWAP"],
+    "高波动OOS": ["COIN-USDT-SWAP", "MSTR-USDT-SWAP", "PLTR-USDT-SWAP"],
+    "训练池(参考)": ["MU-USDT-SWAP", "SOXL-USDT-SWAP", "NVDA-USDT-SWAP", "TSLA-USDT-SWAP"],
+}
+
+
+def costgate() -> None:
+    """按板块池化跑【净edge成本闸门】(不只IC), 用冻结的 ST720 模型。跨标的样本外(同期), 纯历史不交易。
+    回答: 哪个板块的信号真过成本墙(taker+x1.5应力+t>2), 而不只是方向对。"""
+    d = FROZEN / CANDIDATE["code"]
+    if not (d / "meta.json").exists():
+        log("尚未冻结 — 先 --mode freeze"); return
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    H, bar_ms = meta["H"], meta["bar_ms"]
+    blob = pickle.load(open(d / "model.pkl", "rb"))
+    model, kind, scaler = blob["model"], blob["kind"], blob["scaler"]
+    sel = json.loads((d / "feature_list.json").read_text(encoding="utf-8"))
+    med = pd.Series(json.loads((d / "median.json").read_text(encoding="utf-8")))
+    costs = pmw.WorkflowCosts()
+
+    def _score(panel):
+        for c in sel:
+            if c not in panel.columns:
+                panel[c] = np.nan
+        cl = panel.replace([np.inf, -np.inf], np.nan).dropna(subset=["fwd", "y"])
+        if len(cl) < 500:
+            return None
+        X = cl[sel].fillna(med).values
+        Xf = scaler.transform(X) if scaler is not None else X
+        oos = cl[["ts", "inst", "fwd", "y"]].copy()
+        oos["score"] = pmw._score_from_model(kind, model, Xf)
+        return oos
+
+    # bucket 阈值用冻结模型在训练池上的 |train score|(部署一致)
+    tp = _score(_pooled_panel(meta["symbols"], FREEZE_DAYS, H, bar_ms, update=True))
+    train_abs = np.abs(tp["score"].values) if tp is not None else np.array([])
+
+    def _pool_gate(syms):
+        oos = _score(_pooled_panel(syms, GEN_DAYS, H, bar_ms, update=True))
+        if oos is None or not len(train_abs):
+            return None
+        mm = pmw.evaluate_scores(oos, H, bar_ms, train_abs, costs=costs, mode="single_asset")
+        if mm.get("skip"):
+            return {"skip": True}
+        cells = [(fr, c) for fr, c in mm.get("curve", []) if c is not None]
+        pass_cells = [(fr, c) for fr, c in cells if pmw._cell_pass(c, costs, min_ts=50)]
+        stress = [(fr, c) for fr, c in pass_cells if pmw._stress_pass(c, costs)]
+        gate = mm.get("primary_ic", 0.0) > 0.01 and len(pass_cells) >= 2 and len(stress) >= 1
+        bc = max(cells, key=lambda fc: (fc[1].get("net_10", -1e9), fc[1].get("t_10", -1e9)),
+                 default=(None, None))[1] or {}
+        return {"gate": gate, "ic": mm.get("primary_ic"), "auc": mm.get("auc"),
+                "net10": bc.get("net_10"), "t10": bc.get("t_10"), "net15": bc.get("net_15"),
+                "n_ts": bc.get("n_ts"), "n_pass": len(pass_cells), "n_stress": len(stress)}
+
+    out = ["=" * 92, "ST720 按板块 净edge成本闸门 (冻结模型; 跨标的OOS同期; 纯历史不交易)", "=" * 92,
+           "门控: ic>0.01 且 ≥2桶过 maker+taker净>0(t>2) 且 ≥1桶过15bps应力。看哪个板块真过成本墙。", ""]
+    for name, syms in POOLS.items():
+        r = _pool_gate(syms)
+        if r is None:
+            out.append(f"{name:14} 数据不足/跳过"); continue
+        if r.get("skip"):
+            out.append(f"{name:14} 信号过少, evaluate skip"); continue
+        out.append(f"{name:14} gate={str(r['gate']):5} ic={r['ic']:+.4f} auc={r['auc']:.3f} "
+                   f"net10={r['net10']}bps(t{r['t10']}) net15={r['net15']} n_ts={r['n_ts']} "
+                   f"(pass桶{r['n_pass']}/应力{r['n_stress']})")
+    out.append("=" * 92)
+    rep = "\n".join(out)
+    (OUT / "reports").mkdir(parents=True, exist_ok=True)
+    (OUT / "reports" / "stock_costgate.txt").write_text(rep, encoding="utf-8")
+    print("\n" + rep)
+
+
 def selftest() -> None:
     assert forward_verdict(5.0, 2.5, 6.0, 60, 1, 1, 2.0) == "PASS"
     assert forward_verdict(5.0, 2.5, 6.0, 40, 1, 1, 2.0) == "PENDING"     # n<50
@@ -325,10 +400,11 @@ def selftest() -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="US-stock 日历候选 forward 实测。")
-    ap.add_argument("--mode", choices=["freeze", "evaluate", "snapshot", "selftest", "generalize"], required=True)
+    ap.add_argument("--mode", choices=["freeze", "evaluate", "snapshot", "selftest", "generalize", "costgate"],
+                    required=True)
     args = ap.parse_args()
     {"freeze": freeze, "evaluate": evaluate, "snapshot": snapshot, "selftest": selftest,
-     "generalize": generalize}[args.mode]()
+     "generalize": generalize, "costgate": costgate}[args.mode]()
 
 
 if __name__ == "__main__":
