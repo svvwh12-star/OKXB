@@ -17,4 +17,12 @@ foreach ($a in @("btc", "eth")) {
         Where-Object { $_ -match '^\[|evaluate |appended|跳过|为空|ConnectError|Error|Traceback' } |
         Out-File -Append -FilePath $log -Encoding utf8
 }
+# 股票日历候选 ST720 的 forward 评估(池化MU/SOXL/NVDA/TSLA, 与加密一并累积)
+$stock = Join-Path $root "stock_calendar_research\scripts\run_stock_forward.py"
+if (Test-Path $stock) {
+    "--- stock ST720 evaluate ---" | Out-File -Append -FilePath $log -Encoding utf8
+    & $py $stock --mode evaluate 2>&1 |
+        Where-Object { $_ -match '^\[ST|->|Error|Traceback' } |
+        Out-File -Append -FilePath $log -Encoding utf8
+}
 "--- done $(Get-Date -Format o) ---" | Out-File -Append -FilePath $log -Encoding utf8
