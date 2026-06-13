@@ -56,6 +56,11 @@ CANDIDATE = {"code": "ST720", "H": 720, "model": "hist_gbm",
              "symbols": sc.SYMBOLS, "top_frac": 0.10, "oos_ic_sign": +1}
 FREEZE_DAYS = 100
 EVAL_DAYS = 110
+GEN_DAYS = 100
+# 留出泛化检验用: 训练4只之外、有一定流动性的其它 OKX 股票永续(模型从未见过)
+HELDOUT = ["INTC-USDT-SWAP", "MRVL-USDT-SWAP", "MSTR-USDT-SWAP", "AMD-USDT-SWAP", "COIN-USDT-SWAP",
+           "QQQ-USDT-SWAP", "GOOGL-USDT-SWAP", "AAPL-USDT-SWAP", "AMZN-USDT-SWAP", "MSFT-USDT-SWAP",
+           "SPY-USDT-SWAP", "META-USDT-SWAP", "NFLX-USDT-SWAP", "PLTR-USDT-SWAP", "AVGO-USDT-SWAP"]
 K_SEL = 12
 PRESET = "deep"
 TAKER_BPS = 10.0
@@ -245,6 +250,69 @@ def snapshot() -> None:
     print("SNAPSHOT_JSON " + json.dumps({"tau": round(tau, 4), "scores": scores}, ensure_ascii=False))
 
 
+def generalize() -> None:
+    """留出泛化检验: 用冻结的 ST720 模型给【从未训练过的】其它股票永续打分, 看样本外IC。
+    结构性通性 -> 留出名字也多数正IC; 过拟合这4只 -> 留出~0/负。(同期, 跨标的OOS; 纯历史, 不交易)"""
+    d = FROZEN / CANDIDATE["code"]
+    if not (d / "meta.json").exists():
+        log("尚未冻结 — 先 --mode freeze"); return
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    H, bar_ms = meta["H"], meta["bar_ms"]
+    blob = pickle.load(open(d / "model.pkl", "rb"))
+    model, kind, scaler = blob["model"], blob["kind"], blob["scaler"]
+    sel = json.loads((d / "feature_list.json").read_text(encoding="utf-8"))
+    med = pd.Series(json.loads((d / "median.json").read_text(encoding="utf-8")))
+    train_syms = list(meta["symbols"])
+
+    def _ic(symbol: str):
+        df = cd.get_candles(symbol, BAR, GEN_DAYS, DATA / "candles", force=False, update=True, log=log)
+        if len(df) < 1000:
+            return None
+        panel = sc.build_calendar_panel(symbol, df, H, bar_ms)
+        for c in sel:
+            if c not in panel.columns:
+                panel[c] = np.nan
+        cl = panel.replace([np.inf, -np.inf], np.nan).dropna(subset=["fwd"])
+        if len(cl) < 500:
+            return None
+        X = cl[sel].fillna(med).values
+        Xf = scaler.transform(X) if scaler is not None else X
+        ic = cr._spearman(pmw._score_from_model(kind, model, Xf), cl["fwd"].values)
+        span = (int(df["ts"].iloc[-1]) - int(df["ts"].iloc[0])) / 86_400_000
+        return (round(float(ic or 0.0), 4), len(cl), round(span, 0))
+
+    out = ["=" * 80, "ST720 留出泛化检验: 冻结模型在【未训练的】股票永续上的样本外IC", "=" * 80,
+           f"训练于: {', '.join(s.split('-')[0] for s in train_syms)} | 读法: 训练名字都强正; "
+           "留出名字若多数正 -> 结构性通性; 若~0/负 -> 过拟合这4只。", "",
+           "训练名字(参考, 同模型 in-sample 偏乐观):"]
+    for s in train_syms:
+        r = _ic(s)
+        out.append(f"  {s.split('-')[0]:6} IC={r[0]:+.4f} (n{r[1]}, {r[2]:.0f}d)" if r else f"  {s.split('-')[0]:6} 数据不足")
+    out.append("\n留出名字(从未训练, 真泛化):")
+    ics = []
+    for s in [x for x in HELDOUT if x not in train_syms]:
+        r = _ic(s)
+        if r:
+            ics.append(r[0]); out.append(f"  {s.split('-')[0]:6} IC={r[0]:+.4f} (n{r[1]}, {r[2]:.0f}d)")
+        else:
+            out.append(f"  {s.split('-')[0]:6} 数据不足, 跳过")
+    if ics:
+        pos = sum(1 for x in ics if x > 0)
+        med_ic, mean_ic = float(np.median(ics)), float(np.mean(ics))
+        out.append(f"\n留出汇总: {len(ics)}只, 正IC {pos}只, 中位IC={med_ic:+.4f}, 均值={mean_ic:+.4f}")
+        if pos >= 0.7 * len(ics) and med_ic > 0.02:
+            out.append("=> 倾向【结构性通性】: 多数未见名字也正IC, 不只是这4只的脾气。")
+        elif pos <= 0.5 * len(ics) or med_ic < 0.005:
+            out.append("=> 倾向【过拟合/弱泛化】: 留出名字IC普遍~0或负, 效应不通用。")
+        else:
+            out.append("=> 混合/边界: 部分泛化, 谨慎对待。")
+    out.append("=" * 80)
+    rep = "\n".join(out)
+    (OUT / "reports").mkdir(parents=True, exist_ok=True)
+    (OUT / "reports" / "stock_generalize.txt").write_text(rep, encoding="utf-8")
+    print("\n" + rep)
+
+
 def selftest() -> None:
     assert forward_verdict(5.0, 2.5, 6.0, 60, 1, 1, 2.0) == "PASS"
     assert forward_verdict(5.0, 2.5, 6.0, 40, 1, 1, 2.0) == "PENDING"     # n<50
@@ -257,9 +325,10 @@ def selftest() -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="US-stock 日历候选 forward 实测。")
-    ap.add_argument("--mode", choices=["freeze", "evaluate", "snapshot", "selftest"], required=True)
+    ap.add_argument("--mode", choices=["freeze", "evaluate", "snapshot", "selftest", "generalize"], required=True)
     args = ap.parse_args()
-    {"freeze": freeze, "evaluate": evaluate, "snapshot": snapshot, "selftest": selftest}[args.mode]()
+    {"freeze": freeze, "evaluate": evaluate, "snapshot": snapshot, "selftest": selftest,
+     "generalize": generalize}[args.mode]()
 
 
 if __name__ == "__main__":
