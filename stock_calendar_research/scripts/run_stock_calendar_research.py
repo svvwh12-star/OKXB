@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from okxb.research import candle_data as cd          # noqa: E402
+from okxb.research import candle_research as cr        # noqa: E402
 from okxb.research import pro_model_workflow as pmw   # noqa: E402
 
 OUT = ROOT / "stock_calendar_research"
@@ -99,6 +100,7 @@ def _gate_for_H(panel: pd.DataFrame, H: int, bar_ms: int, preset: str, costs) ->
     if comp.get("error"):
         return {"error": comp["error"]}
     best = None
+    best_odf = None
     rows = []
     for name, (odf, train_abs) in comp["models"].items():
         mm = pmw.evaluate_scores(odf, H, bar_ms, train_abs, costs=costs, mode="single_asset") if len(odf) else {"skip": True}
@@ -117,7 +119,15 @@ def _gate_for_H(panel: pd.DataFrame, H: int, bar_ms: int, preset: str, costs) ->
         rows.append(cand)
         if best is None or (cand["gate"], cand.get("net10") or -1e9) > (best["gate"], best.get("net10") or -1e9):
             best = cand
-    return {"best": best, "all": rows, "selected_freq": comp["selected_freq"][:12]}
+            best_odf = odf
+    # 稳健性: best 模型的【逐标的】样本外 IC —— 边际是广谱还是被单只带动?
+    per_sym = {}
+    if best_odf is not None and len(best_odf):
+        cl = best_odf.replace([np.inf, -np.inf], np.nan).dropna(subset=["score", "fwd"])
+        for inst, g in cl.groupby("inst"):
+            ic = cr._spearman(g["score"].values, g["fwd"].values) if len(g) > 30 else float("nan")
+            per_sym[str(inst).split("-")[0]] = (round(float(ic), 4), len(g))
+    return {"best": best, "all": rows, "selected_freq": comp["selected_freq"][:12], "per_sym": per_sym}
 
 
 def run(days: int, preset: str, force: bool) -> None:
@@ -158,6 +168,10 @@ def run(days: int, preset: str, force: bool) -> None:
                      f"net10={b.get('net10')}bps(t{b.get('t10')})  net15={b.get('net15')}  n_ts={b.get('n_ts')}")
         topf = ", ".join(f"{k}×{v}" for k, v in res.get("selected_freq", [])[:8])
         lines.append(f"        常选特征: {topf}")
+        ps = res.get("per_sym", {})
+        if ps:
+            lines.append("        逐标的OOS-IC(广谱性): " +
+                         "  ".join(f"{k}={v[0]:+.3f}(n{v[1]})" for k, v in ps.items()))
         summary.append((H, b))
     tradable = any((b or {}).get("gate") for _, b in summary)
     lines += ["", "结论:"]
