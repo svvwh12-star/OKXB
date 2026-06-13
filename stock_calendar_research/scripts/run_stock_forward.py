@@ -1,10 +1,11 @@
 """US-stock-perp 日历结构 候选 forward 实测 (预登记冻结 + 前向裁决)。
 
-冻结候选(预登记; 来自 run_stock_calendar_research 的 100d/deep + --robust 稳健性电池):
-  ST720: H=720min, hist_gbm, 池化 MU/SOXL/NVDA/TSLA, top_frac=0.10, oos_ic_sign=+1
+冻结候选(预登记; 来自 100d/deep + --robust + 留出泛化 + 按板块成本闸门):
+  ST720: H=720min, hist_gbm, 池化【半导体篮子】MU/NVDA/AMD/MRVL/INTC/AVGO/SOXL, top_frac=0.10, ic+1
          机制: 永续相对"最近一次RTH(美东9:30-16:00)收盘"的隔夜/周末漂移 -> 均值回归。
-         in-sample: 过净edge闸门 + 4只逐标的IC全正 + 前后半都正 + 复现一致; 但门控借线(t~2)、
-         样本仅~100天 -> 历史过闸【必须】由 forward 样本外裁决, 现不可交易。
+         证据链: 留出15只全正IC(结构通性); 按板块成本闸门【只有半导体过净edge墙】(留出半导体
+         AMD/MRVL/INTC/AVGO 独立过闸, AUC0.605/t2.87), 指数/巨头/低波动 IC正但扛不住成本。
+         警惕: 以上全是【同期~100天】证据; 板块也由同期闸门选出 -> 真正裁判是【未来时段】forward。
 诚实先验: 短样本历史过闸常是假阳; forward 大概率仍 PENDING/KILL。demo-only, 过 PASS 前不实盘。
 
 freeze  : 在【钉死的100天窗口+固定种子】上训练, 存 model/feats/median/scaler/tau + 元数据。
@@ -51,9 +52,13 @@ FROZEN = OUT / "frozen"
 FWD = OUT / "forward"
 BAR = sc.BAR
 
+# 半导体篮子: 由成本闸门指明的【唯一过净edge墙】的板块(含独立过闸的留出名字 AMD/MRVL/INTC/AVGO)。
+# 诚实标注: 板块由【同期】成本闸门选出 -> 候选选择用了同期信息; 真正的裁判是【未来时段】的 forward。
+SEMI_POOL = ["MU-USDT-SWAP", "NVDA-USDT-SWAP", "AMD-USDT-SWAP", "MRVL-USDT-SWAP",
+             "INTC-USDT-SWAP", "AVGO-USDT-SWAP", "SOXL-USDT-SWAP"]
 # 预登记冻结候选(钉死, 不事后改)
 CANDIDATE = {"code": "ST720", "H": 720, "model": "hist_gbm",
-             "symbols": sc.SYMBOLS, "top_frac": 0.10, "oos_ic_sign": +1}
+             "symbols": SEMI_POOL, "top_frac": 0.10, "oos_ic_sign": +1}
 FREEZE_DAYS = 100
 EVAL_DAYS = 110
 GEN_DAYS = 100
