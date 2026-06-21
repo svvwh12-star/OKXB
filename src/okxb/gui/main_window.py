@@ -198,6 +198,8 @@ class OKXBApp(ctk.CTk):
         self.pick_pool.set("全部"); self.pick_pool.pack(side="left", padx=8)
         ctk.CTkButton(pbar, text="🤖 AI选品推荐", font=FONT_B, width=120, fg_color="#7a5cff",
                       command=self._ai_pick_run).pack(side="left", padx=4)
+        ctk.CTkButton(pbar, text="🚀 一键累计数据", font=FONT_B, width=128, fg_color="#2e7d32",
+                      command=self._one_click_accrue).pack(side="left", padx=4)
         ctk.CTkLabel(pbar, text="(点列名可排序↑↓)", font=FONT_S,
                      text_color=GREY).pack(side="left", padx=8)
         ctk.CTkButton(pbar, text="⚠ 一键全平", font=FONT_B, width=120, fg_color="#a83232",
@@ -584,6 +586,36 @@ class OKXBApp(ctk.CTk):
         threading.Thread(target=work, daemon=True).start()
 
     # ----------------- AI 选品 -----------------
+
+    def _one_click_accrue(self) -> None:
+        """一键开始【累计研究数据】(exe 内可用): 启动 demo 录制引擎 + 触发 IMR 前向采集。
+        AI 研判按需点(耗 token, 不放进自动循环)。"""
+        from .controller import imr_collect_sync
+        parts = []
+        mode = read_env().get("OKXB_MODE", "demo")
+        if mode != "demo":
+            parts.append("• 当前【实盘】模式 → 跳过自动启动引擎(避免动真金)。要录制请切『虚拟盘』。")
+        elif self.ctrl.running:
+            parts.append("• 引擎已在运行 → calib 录制数据持续累积中。")
+        elif not read_env().get("OKX_DEMO_API_KEY"):
+            parts.append("• 未配置虚拟盘密钥 → 跳过引擎录制(到『账户与密钥』填 demo 密钥)。")
+        else:
+            self.ctrl.start(dry_run=True)
+            self.start_btn.configure(state="disabled")
+            self.stop_btn.configure(state="normal")
+            self.mode_seg.configure(state="disabled")
+            parts.append("• 已启动【虚拟盘·只演练】引擎 → 累积 calib 录制(供策略校准/信号检验)。")
+        parts.append("• IMR 15/30min 前向采集: 后台触发中(进度见『多周期研究』页 IMR 区)。")
+        parts.append("• AI 研判: 按需点『AI分析』/『AI选品』即可(会耗 token, 故不放进自动循环)。")
+        self._append_log("[一键累计] " + " / ".join(parts))
+        messagebox.showinfo("一键累计数据", "\n".join(parts) +
+                            "\n\n数据随时间累积; 已注册的 4 小时计划任务也会无人值守采集 BTC/ETH/股票/IMR。")
+
+        def work():
+            r = imr_collect_sync()
+            tail = (r.splitlines() or ["(无输出)"])[-1]
+            self.after(0, lambda: self._append_log("[一键累计·IMR] " + tail))
+        threading.Thread(target=work, daemon=True).start()
 
     def _ai_pick_run(self) -> None:
         pool = {"加密": "crypto", "美股": "stock", "全部": "all"}.get(self.pick_pool.get(), "all")

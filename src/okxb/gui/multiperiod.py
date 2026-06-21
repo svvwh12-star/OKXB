@@ -14,14 +14,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .. import paths
+
 _MODELS = {
     "btc": {"A": "hist_gbm(180min)", "B": "lightgbm(6h)", "C": "mlp(9h)"},
     "eth": {"A": "rf_ret(180min)", "B": "logit_l2(6h)", "C": "hist_gbm(9h)"},
 }
 
+# 打包 exe 内: 没有 python 子进程、没有研究目录、LightGBM/MLP 已被精简掉 -> 这些 BTC/ETH 多周期功能不可用。
+FROZEN_MSG = ("打包版(exe)内不支持 BTC/ETH 多周期(它依赖开发态 python + LightGBM/MLP + 研究目录)。\n"
+              "→ 想做日内研究, 请用下方『IMR · 15/30min』按钮(进程内, exe 可用);\n"
+              "→ 想跑 BTC/ETH 多周期, 请用开发态 python okxb_gui.py。")
+
 
 def _root() -> Path:
-    return Path(__file__).resolve().parents[3]            # src/okxb/gui -> <project root>
+    return paths.APP_DIR                                   # 开发态=项目根; 打包态=exe同级(不会是Temp)
 
 
 def _research() -> Path:
@@ -71,6 +78,8 @@ def forward_status(asset: str = "btc") -> dict:
 def shadow_run(armed: bool, asset: str = "btc") -> str:
     """subprocess 跑 run_forward_shadow.py --asset {asset} --mode shadow [--arm], 返回精简输出。
     armed=False: dry-run(公共数据, 不下单); armed=True: 在 demo 真下单(需 OKXB_MODE=demo + demo 密钥)。"""
+    if paths.is_frozen():
+        return FROZEN_MSG
     script = _research() / "scripts" / "run_forward_shadow.py"
     if not script.exists():
         return (f"未找到 {script}\n(多周期研究依赖 btc_single_asset_research/; "
@@ -98,6 +107,8 @@ def auto_step(live: bool, asset: str = "btc") -> str:
     """跑一轮 {asset} 多周期自动交易: --asset {asset} --mode auto。
     demo(live=False): 直接影子下单(执行验证); live=True: 先 evaluate 刷新 verdict, 再【仅对 PASS 候选】实盘下单。
     现状 A/B/C 全 PENDING -> 实盘这步不会下任何单(门控按预期工作)。subprocess, 仅开发态/随附研究目录可用。"""
+    if paths.is_frozen():
+        return FROZEN_MSG
     script = _research() / "scripts" / "run_forward_shadow.py"
     if not script.exists():
         return (f"未找到 {script}\n(多周期自动交易依赖 btc_single_asset_research/; 仅开发态可用)")
@@ -134,6 +145,8 @@ def _parse_scores(shadow_out: str) -> dict:
 
 def _get_snapshot(asset: str = "btc") -> dict:
     """subprocess 跑 --asset {asset} --mode snapshot, 解析 {features(客观因子), scores(A/B/C 打分)}。"""
+    if paths.is_frozen():
+        return {}
     script = _research() / "scripts" / "run_forward_shadow.py"
     if not script.exists():
         return {}
@@ -157,6 +170,8 @@ def _get_snapshot(asset: str = "btc") -> dict:
 def ai_compare(asset: str = "btc") -> str:
     """AI 叙述 vs 量化测量 对照(你的方法论): 给 AI 【只】喂客观因子让它【独立盲分析】,
     程序【另行】并排量化测量 + 写死安全裁决。慢: 含一次 snapshot(拉数据+打分) + 一次 AI 调用。"""
+    if paths.is_frozen():
+        return FROZEN_MSG
     models = _MODELS.get(asset, _MODELS["btc"])
     snap = _get_snapshot(asset)
     feats = snap.get("features", {})
