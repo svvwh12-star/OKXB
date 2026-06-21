@@ -989,6 +989,7 @@ class OKXBApp(ctk.CTk):
                     "• 每 15 分钟一轮, 期间不再逐单确认。\n确认开启?"):
                 return
         self._multi_auto_asset = asset                   # 锁定自动交易标的(之后切显示标的不影响它)
+        self._multi_auto_live_locked = live              # H-4: 锁定开启时的实盘决定 (运行中改 checkbox 不再即时升级真金)
         self._multi_auto_on = True
         self.multi_auto_btn.configure(text=f"⏸ 关闭{asset.upper()}多周期自动", fg_color=(RED if live else AMBER))
         self._multi_auto_set_label(live=live)
@@ -998,7 +999,9 @@ class OKXBApp(ctk.CTk):
         if not self._multi_auto_on:
             return
         if not self._multi_busy:
-            live = bool(self.multi_auto_live.get()) and self._m_mode() == "live"
+            # H-4: 用开启时锁定的实盘决定, 不再每轮读 checkbox (防运行中无确认升级真金);
+            # 仍叠加当前模式校验 —— 若期间切离实盘, 只会降级为 demo (安全方向)。
+            live = bool(getattr(self, "_multi_auto_live_locked", False)) and self._m_mode() == "live"
             asset = getattr(self, "_multi_auto_asset", "btc")
             self._multi_busy = True
             self.multi_arm_btn.configure(state="disabled")

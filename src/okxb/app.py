@@ -31,7 +31,8 @@ from .features.engine import FeatureEngine
 from .marketdata.gateway import MarketDataGateway
 from .monitor.telegram import TelegramNotifier
 from .research.recorder import TickRecorder
-from .risk.engine import RiskEngine, is_stock_perp, set_stock_symbols
+from .risk.engine import (RiskEngine, is_stock_perp, set_stock_symbols,
+                          stock_classification_mismatches)
 from .signal.composite import CompositeScorer
 from .state.store import StateStore
 from .strategies.basis import BasisMeanRev
@@ -92,6 +93,7 @@ class App:
         self._diag_min_trad = float(sg.get("min_tradability", 0.5))
         self._diag_max_spread = float(sg.get("max_entry_spread_bps", 50.0))
         self._diag_rv_lo = float(sg.get("regime_rv_lo", 5e-5))
+        self._data_age_max = int(self.cfg.get("kill_switch.data_age_ms_max", 500))  # H-3 逐标的老化门
         self.store = StateStore(paths.data_path(
             self.cfg.get("paths.state_db", "data/okxb_state.sqlite")))
         self.universe: list[str] = []
@@ -106,6 +108,8 @@ class App:
         self._acct_positions = 0
         self._acct_upl = 0.0
         self._acct_ok = False
+        # H-2: 交易所真实持仓快照 (含手动/外部/残留仓), 每次刷新更新, 回灌风控并发/名义统计
+        self._acct_pos_map: dict[str, dict] = {}
 
     def _log(self, msg: str) -> None:
         line = f"{datetime.datetime.now().strftime('%H:%M:%S')} {msg}"
@@ -137,6 +141,24 @@ class App:
                   f"标的({len(self.universe)}) [{diag.get('mode')}: 加密{diag.get('crypto', '?')}+"
                   f"股票{diag.get('stock', '?')}]")
         self._log(f"标的: {self.universe}")
+        # C-1: 配置指纹 + 关键风控值落日志 (任何配置漂移立刻可见, 防 dist/源码不一致)
+        import hashlib
+        cfg_p = paths.config_path()
+        try:
+            digest = hashlib.sha256(cfg_p.read_bytes()).hexdigest()[:12]
+        except Exception:
+            digest = "?"
+        self._log(f"配置指纹 {cfg_p} sha256:{digest} | 并发≤{self.cfg.get('account.max_concurrent_positions')}"
+                  f" 总名义≤{self.cfg.get('risk.max_total_notional_normal')}"
+                  f" 回撤硬停{self.cfg.get('account.total_drawdown_hard_stop_pct')}%"
+                  f" stock_symbols×{len(self.cfg.get('universe.stock_symbols', []) or [])}")
+        # C-2: 分类漂移 fail-closed —— 明显是美股却未被识别 (dist 缺 stock_symbols) 则剔除, 不带病交易
+        mism = stock_classification_mismatches(self.universe)
+        if mism:
+            self._alert(f"⚠ 配置分类漂移: {mism} 明显是美股却不在 universe.stock_symbols; "
+                        f"已 fail-closed 从交易池剔除 (请同步 config 的 stock_symbols 再重打包)")
+            drop = set(mism)
+            self.universe = [s for s in self.universe if s not in drop]
         self.gw = MarketDataGateway(self.cfg, self.secrets, self.universe)
         self.fe = FeatureEngine(self.gw, self.cfg)
 
@@ -158,29 +180,57 @@ class App:
         )
         # 初始权益用配置值立即就绪 (非网络); 真实权益由主循环 housekeep 异步刷新, 不阻塞启动
         self.risk.set_account(self.cfg.get("account.initial_equity_usdt", 1000), {})
+        # C-4: 从持久化恢复熔断/回撤状态 (此前纯内存, 重启即清零可绕过『当日不可恢复』硬停)
+        try:
+            saved = await self.store.get_kv("risk_state")
+            if saved:
+                self.risk.load_state(saved)
+                if self.risk._halted_permanently:
+                    self._alert(f"⛔ 恢复持久化熔断: {self.risk._halt_reason} "
+                                f"(状态=HALTED, 需人工 clear_halt 才能继续交易)")
+        except Exception as e:
+            self._log(f"风控状态恢复失败(按全新状态启动): {e!r}")
         # 探测账户持仓模式(net/long_short), 注入执行器 -> 正确的 posSide, 否则双向账户下单报 posSide error
         if self._has_keys:
+            accfg: dict = {}
             try:
                 accfg = await self.rest.get_account_config()
                 self.executor._pm = accfg.get("posMode", "net_mode") or "net_mode"
                 self._log(f"账户持仓模式={self.executor._pm} (双向账户已自动适配 posSide)")
-            except Exception:
-                pass
+            except Exception as e:
+                if (not self.dry_run) and self.secrets.mode == Mode.LIVE:
+                    raise RuntimeError(f"无法核验账户配置(权限/IP), 拒绝实盘启动: {e!r}")
+                self._log(f"账户配置探测失败(演练/模拟放行): {e!r}")
+            # H-5: 实盘真金启动前程序化核验密钥权限/IP, fail-closed (此前仅 verify_account.py 手动可跳过)
+            live_real = (not self.dry_run) and (self.secrets.mode == Mode.LIVE)
+            perm = str(accfg.get("perm", "") or "")
+            ip = str(accfg.get("ip", "") or "")
+            if "withdraw" in perm:
+                if live_real:
+                    raise RuntimeError("密钥含【提现】权限 — 拒绝实盘启动 (泄漏即可被提空)。请去 OKX 关闭提现权限。")
+                self._alert("⚠ 密钥含提现权限(高危); demo/演练放行, 实盘将拒启动。")
+            if live_real and self.cfg.get("permissions.ip_whitelist_required", True) and not ip:
+                raise RuntimeError("密钥未绑定 IP 白名单 — 拒绝实盘启动。请在 OKX 绑定本机/VPS 出口 IP。")
+            # H-6: 账户层级不支持衍生品 (acctLv=1 现货) -> fail-closed 清空交易池, 绝不向不可交易标的发单
+            if accfg.get("acctLv") in ("1",):
+                self._alert("⚠ 账户层级=现货, 不支持永续/股票永续 — fail-closed 清空交易池")
+                self.universe = []
         self._update_status()
 
     async def _refresh_account(self) -> None:
         if not self._has_keys:
-            self.risk.set_account(self.cfg.get("account.initial_equity_usdt", 1000), {})
+            self.risk.update_equity(self.cfg.get("account.initial_equity_usdt", 1000))
             return
         try:
             bal = await self.rest.get_balance()
             eq = float(bal.get("totalEq", 0) or 0)
-            self.risk.set_account(eq or self.risk.initial_equity, self.risk.open_positions)
-            # 真实持仓 (含手动开的), 供控制台卡片如实显示
+            self.risk.update_equity(eq or self.risk.initial_equity)   # C-3: 真实权益(含浮亏)驱动回撤硬停
+            # 真实持仓 (含手动/外部开的): 控制台如实显示 + H-2 回灌风控敞口
             poss = await self.rest.get_positions("SWAP")
             live = [p for p in poss if float(p.get("pos", 0) or 0) != 0]
             self._acct_positions = len(live)
             self._acct_upl = sum(float(p.get("upl", 0) or 0) for p in live)
+            self._acct_pos_map = {p["instId"]: p for p in live if p.get("instId")}
             self._acct_ok = True
         except Exception:
             pass            # 网络抖动等; 外层主循环已兜底, 保留上次权益
@@ -276,7 +326,8 @@ class App:
                 f"(录制{self.recorder.count}行)")
 
     def _sync_positions_to_risk(self) -> None:
-        """把受管持仓回灌风控, 使全局并发数/总名义/单标的上限真正生效。"""
+        """把真实敞口回灌风控, 使全局并发数/总名义/单标的上限真正生效。
+        H-2: 不止自管仓 —— 合并交易所真实持仓 (含手动/外部/崩溃残留), 否则真实敞口被系统性低估。"""
         pos = {}
         for mp in self.om.all():
             ctval = self.instruments.ct_val(mp.inst_id)
@@ -284,6 +335,21 @@ class App:
             pos[mp.inst_id] = Position(
                 inst_id=mp.inst_id, pos_side=PosSide.NET, size=mp.contracts,
                 avg_px=mp.entry_px, notional_usdt=notional, upl=Decimal("0"))
+        # 真实持仓快照覆盖/补充 (权威: 优先用交易所名义额; 含本程序未自管的仓)
+        for inst, p in (self._acct_pos_map or {}).items():
+            try:
+                notional = abs(float(p.get("notionalUsd") or 0))
+                if notional <= 0:
+                    sz = abs(float(p.get("pos") or 0))
+                    mark = float(p.get("markPx") or p.get("avgPx") or 0)
+                    notional = sz * mark * self.instruments.ct_val(inst)
+                pos[inst] = Position(
+                    inst_id=inst, pos_side=PosSide.NET,
+                    size=Decimal(str(abs(float(p.get("pos") or 0)))),
+                    avg_px=Decimal(str(p.get("avgPx") or 0)),
+                    notional_usdt=Decimal(str(notional)), upl=Decimal(str(p.get("upl") or 0)))
+            except Exception:
+                continue
         self.risk.open_positions = pos
 
     async def _tick(self) -> None:
@@ -319,6 +385,8 @@ class App:
                             self._cooldown[inst] = time.time() * 1000.0 + self._cooldown_ms
                     continue
                 if time.time() * 1000.0 < self._cooldown.get(inst, 0.0):   # 冷却中不开新仓
+                    continue
+                if self.gw.symbol_age_ms(inst) > self._data_age_max:        # H-3: 单标的行情陈旧 -> 不开新仓
                     continue
                 for strat in self.strategies:
                     sig = strat.evaluate(fs, comp, self.scorer)
@@ -386,6 +454,10 @@ class App:
                         await self.executor.arm_kill_switch()
                         await self._refresh_account()   # 真实权益异步刷新
                         await self._update_marks()      # 标记价 -> basis
+                        try:                            # C-4: 周期落盘风控状态
+                            await self.store.set_kv("risk_state", self.risk.to_state())
+                        except Exception:
+                            pass
                         state = self.risk.system_state.value
                         if self._last_alert_state and state != self._last_alert_state:
                             self._alert(f"⚠ 系统状态变化: {self._last_alert_state} -> {state}")
@@ -418,6 +490,10 @@ class App:
                 if pw_task:
                     pw_task.cancel()
             self.recorder.close()
+            try:                                # C-4: 停机前落盘最终风控状态
+                await self.store.set_kv("risk_state", self.risk.to_state())
+            except Exception:
+                pass
             await self.store.close()
             await self.rest.aclose()
             await self.pub_rest.aclose()

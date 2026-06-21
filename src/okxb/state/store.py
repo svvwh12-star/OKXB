@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, kind TEXT, msg TEXT
 );
+CREATE TABLE IF NOT EXISTS kv (
+  k TEXT PRIMARY KEY, v TEXT, ts INTEGER
+);
 """
 
 
@@ -90,3 +93,24 @@ class StateStore:
             "INSERT INTO audit(ts,kind,msg) VALUES(?,?,?)", (self._now(), kind, msg)
         )
         await self._db.commit()
+
+    async def set_kv(self, key: str, value: dict) -> None:
+        """持久化任意 JSON 状态 (如风控熔断/回撤快照), 跨重启可读回。"""
+        assert self._db
+        await self._db.execute(
+            "INSERT INTO kv(k,v,ts) VALUES(?,?,?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v, ts=excluded.ts",
+            (key, json.dumps(value, ensure_ascii=False), self._now()),
+        )
+        await self._db.commit()
+
+    async def get_kv(self, key: str) -> Optional[dict]:
+        assert self._db
+        async with self._db.execute("SELECT v FROM kv WHERE k=?", (key,)) as cur:
+            row = await cur.fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            return json.loads(row[0])
+        except (ValueError, TypeError):
+            return None

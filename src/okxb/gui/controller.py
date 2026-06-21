@@ -78,12 +78,14 @@ class EngineController:
         from ..app import App
         self._loop = asyncio.get_running_loop()
         self.app = App(dry_run=dry_run, log_fn=self._on_log)
+        set_active_engine(self)        # H-1: 供手动下单路径查询风控状态 (HALTED/CLOSE_ONLY 时阻断开仓)
         self.running = True
         try:
             await self.app.setup()
             await self.app.run()
         finally:
             self.running = False
+            set_active_engine(None)
 
     def _on_log(self, line: str) -> None:
         self.logs.append(line)
@@ -410,8 +412,37 @@ async def _sz_from(rest, spec, amount, unit, ref_px):
     return str(contracts), f" (≈{amount}U)", None
 
 
+# ----------------- H-1: 手动开仓的 RiskEngine 状态闸门 -----------------
+# 此前手动下单/套单/设杠杆完全绕过 RiskEngine; 至少在引擎处于熔断/只平仓态时阻断【开仓/加杠杆】。
+_active_engine = None
+
+
+def set_active_engine(ctrl) -> None:
+    global _active_engine
+    _active_engine = ctrl
+
+
+def _manual_open_guard() -> Optional[str]:
+    """引擎处于 HALTED/CLOSE_ONLY 时返回阻断原因 (供开仓/加杠杆路径前置检查); 否则 None。
+    引擎未运行时不阻断 (纯手动操作由用户自负, 不在本闸门范围)。"""
+    ctrl = _active_engine
+    try:
+        if ctrl is not None and getattr(ctrl, "running", False) and getattr(ctrl, "app", None) is not None:
+            st = getattr(ctrl.app.risk.system_state, "name", "")
+            if st in ("HALTED", "CLOSE_ONLY"):
+                return (f"⛔ 引擎状态={st} (熔断/只平仓), 已阻断手动开仓/加杠杆以维护风控闸门。"
+                        f"如确需操作请先人工确认风险 (clear_halt)。平仓/撤单不受影响。")
+    except Exception:
+        return None
+    return None
+
+
 async def _manual_place(inst_id, side, ord_type, amount, unit, px, reduce_only) -> str:
     from ..exchange.okx_rest import OkxError
+    if not reduce_only:                       # 开/加仓才拦; 平仓(reduce_only)始终放行
+        blocked = _manual_open_guard()
+        if blocked:
+            return blocked
     rest, mode, mgn = _new_trade_rest()
     try:
         spec = await _get_spec(rest, inst_id)
@@ -446,6 +477,9 @@ def manual_bracket_sync(inst_id, side, ord_type, amount, unit, px, tp_px, sl_px)
 async def _manual_bracket(inst_id, side, ord_type, amount, unit, px, tp_px, sl_px) -> str:
     """一键套单: 入场单 + 附带止盈(限价)/止损(市价) OCO。价格自动对齐 tickSz; 校验止盈/止损方向。"""
     from ..exchange.okx_rest import OkxError
+    blocked = _manual_open_guard()            # H-1: 套单是开仓, 熔断/只平仓态阻断
+    if blocked:
+        return blocked
     rest, mode, mgn = _new_trade_rest()
     try:
         spec = await _get_spec(rest, inst_id)
@@ -1016,6 +1050,9 @@ async def _manual_close(inst_id) -> str:
 
 async def _manual_set_leverage(inst_id, lever) -> str:
     from ..exchange.okx_rest import OkxError
+    blocked = _manual_open_guard()            # H-1: 熔断/只平仓态不允许加杠杆
+    if blocked:
+        return blocked
     rest, mode, mgn = _new_trade_rest()
     try:
         if not await _get_spec(rest, inst_id):

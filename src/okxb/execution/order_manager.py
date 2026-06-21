@@ -25,6 +25,7 @@ class ManagedPosition:
     entry_ms: int
     max_loss_usdt: Decimal
     tp_order_oid: Optional[str] = None
+    sl_algo_oid: Optional[str] = None    # 交易所端 reduce-only 止损 algo (崩溃/死手开关后仍生效)
     closing: bool = False
     hwm: float = 0.0           # 最高/最低水位 (移动止盈用)
     rev_run: int = 0           # 反转/衰减 连续拍计数
