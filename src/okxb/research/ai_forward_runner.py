@@ -51,6 +51,15 @@ def _now_ms() -> int:
     return int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
 
 
+def truthy(v) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def auto_enabled() -> bool:
+    """无人值守是否自动记录 AI 前向 (AI_FORWARD_AUTO)。"""
+    return truthy(Secrets().ai_forward_auto)
+
+
 def _load_meta() -> Optional[dict]:
     p = _meta_path()
     if p.exists():
@@ -145,24 +154,26 @@ async def _resolve(rest) -> int:
     return len(rows)
 
 
-async def collect() -> str:
-    """记录本轮 AI 方向判断(每标的每 HORIZON 至多一次) + 结算到期记录。返回摘要。"""
+async def collect(record: bool = True) -> str:
+    """结算到期记录; record=True 时再记录本轮 AI 方向判断(每标的每 HORIZON 至多一次)。返回摘要。
+    record=False 用于无人值守仅【免费结算】历史记录而不调用 AI(不烧 token)。"""
     out = []
     meta = _load_meta()
     if meta is None:
         meta = _freeze()
         out.append(f"首次运行: 已冻结 official_forward_start = {meta['frozen_utc']}")
     clf = LLMClassifier.from_secrets(Secrets())
-    if not clf.enabled:
+    if record and not clf.enabled:
         out.append("⚠ AI 未启用(规则/未填 key) → 本轮不记录(AI前向验证需要真实 AI 方向)。"
                    "请到『账户与密钥』选 DeepSeek 填 key 后再用。")
-        # 仍尝试结算历史记录
-    from ..gui.controller import _ai_analyze       # 复用 GUI 同一条 AI 分析路径 (无 tkinter 依赖)
+    if not record:
+        out.append("(自动记录关闭: 仅免费结算到期记录, 不调用 AI)")
     opens = _read_opens()
     now = _now_ms()
     horizon_ms = af.HORIZON_MIN * 60_000
     new_rows = []
-    if clf.enabled:
+    if record and clf.enabled:
+        from ..gui.controller import _ai_analyze   # 复用 GUI 同一条 AI 分析路径 (无 tkinter 依赖)
         for inst in af.WATCHLIST:
             if now - _last_open_ts(opens, inst) < horizon_ms:
                 out.append(f"  {inst}: 冷却中(每{af.HORIZON_MIN}min至多记一次), 跳过")

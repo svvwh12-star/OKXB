@@ -519,6 +519,22 @@ def set_research_dir(path: str) -> str:
         return f"已保存, 但解析失败: {e!r}"
 
 
+def get_ai_forward_auto() -> bool:
+    """无人值守(4h任务)是否也自动记录 AI 前向 (AI_FORWARD_AUTO)。"""
+    try:
+        from ..research.ai_forward_runner import auto_enabled
+        return auto_enabled()
+    except Exception:
+        return False
+
+
+def set_ai_forward_auto(on: bool) -> str:
+    """开/关 无人值守自动记录 AI 前向 (写 .env AI_FORWARD_AUTO)。开=会持续耗 token。"""
+    write_env({"AI_FORWARD_AUTO": "1" if on else ""})
+    return ("已开启: 4 小时计划任务也会自动记录 AI 前向判断(会持续消耗 token)。"
+            if on else "已关闭: 无人值守不再调用 AI(仅免费结算到期记录)。手动按钮不受影响。")
+
+
 async def _get_spec(rest, inst_id):
     from ..exchange.okx_rest import OkxError
     try:

@@ -41,4 +41,15 @@ if (Test-Path $imr) {
         Where-Object { $_ -match 'IMR_|verdict|PENDING|KILL|PASS|Error|Traceback' } |
         Out-File -Append -FilePath $log -Encoding utf8
 }
+# AI 前向验证: auto(AI_FORWARD_AUTO 开才调AI耗token, 关则仅免费结算) + 评估
+$aif = Join-Path $root "ai_forward_research\scripts\run_ai_forward.py"
+if (Test-Path $aif) {
+    "--- AI forward auto+evaluate ---" | Out-File -Append -FilePath $log -Encoding utf8
+    & $py $aif --mode auto 2>&1 |
+        Where-Object { $_ -match '记录|结算|冻结|关闭|链校验|Error|Traceback' } |
+        Out-File -Append -FilePath $log -Encoding utf8
+    & $py $aif --mode evaluate 2>&1 |
+        Where-Object { $_ -match 'PENDING|KILL|PASS|net|IC|Error|Traceback' } |
+        Out-File -Append -FilePath $log -Encoding utf8
+}
 "--- done $(Get-Date -Format o) ---" | Out-File -Append -FilePath $log -Encoding utf8

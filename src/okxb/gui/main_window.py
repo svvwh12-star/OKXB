@@ -966,6 +966,12 @@ class OKXBApp(ctk.CTk):
                       command=lambda: self._aifwd_run("evaluate")).pack(side="left", padx=4)
         ctk.CTkButton(abr, text="📊 查看进度", font=FONT, width=100,
                       command=lambda: self._aifwd_run("status")).pack(side="left", padx=4)
+        from .controller import get_ai_forward_auto
+        self.aifwd_auto = ctk.CTkCheckBox(abr, text="无人值守也记录(4h任务·耗token)", font=FONT_S,
+                                          command=self._toggle_aifwd_auto)
+        if get_ai_forward_auto():
+            self.aifwd_auto.select()
+        self.aifwd_auto.pack(side="left", padx=12)
         self.aifwd_box = ctk.CTkTextbox(aff, height=140, font=MONO)
         self.aifwd_box.pack(fill="x", padx=8, pady=(2, 8))
         self.aifwd_box.insert("end", "点『采集一次』记录一次 AI 判断(需先在『账户与密钥』配好 AI; 会耗少量 token)。\n")
@@ -1014,6 +1020,11 @@ class OKXBApp(ctk.CTk):
                 self._aifwd_set(r)
             self.after(0, done)
         threading.Thread(target=work, daemon=True).start()
+
+    def _toggle_aifwd_auto(self) -> None:
+        from .controller import set_ai_forward_auto
+        msg = set_ai_forward_auto(bool(self.aifwd_auto.get()))
+        self._aifwd_set(msg)
 
     def _pick_research_dir(self) -> None:
         from tkinter import filedialog

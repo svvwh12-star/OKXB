@@ -40,3 +40,15 @@ def test_research_base_honors_env(tmp_path, monkeypatch):
     target = tmp_path / "myresearch"
     monkeypatch.setenv("RESEARCH_DATA_DIR", str(target))
     assert research_base() == target and target.exists()
+
+
+def test_truthy_and_auto_enabled(monkeypatch):
+    from okxb.research import ai_forward_runner as run
+    for v in ("1", "true", "YES", "on", "On"):
+        assert run.truthy(v)
+    for v in ("", "0", "no", "off", None):
+        assert not run.truthy(v)
+    monkeypatch.setenv("AI_FORWARD_AUTO", "1")
+    assert run.auto_enabled() is True
+    monkeypatch.setenv("AI_FORWARD_AUTO", "")
+    assert run.auto_enabled() is False

@@ -76,6 +76,8 @@ class Secrets:
         self.coingecko_api_key = os.getenv("COINGECKO_API_KEY", "")
         # 研究数据保存目录 (IMR / AI 前向验证 共用; 留空=APP_DIR/data)
         self.research_data_dir = os.getenv("RESEARCH_DATA_DIR", "")
+        # 无人值守(4h计划任务)是否也自动记录 AI 前向验证 (会调用 AI 耗 token; 默认关)。GUI 可切。
+        self.ai_forward_auto = os.getenv("AI_FORWARD_AUTO", "")
 
         # AI 事件分类: 提供商无关 (DeepSeek / OpenAI兼容 / Claude); 简单任务用便宜模型, 复杂任务用强模型
         self.ai_provider = os.getenv("AI_PROVIDER", "rule").strip().lower()
