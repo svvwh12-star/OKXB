@@ -30,4 +30,15 @@ if (Test-Path $stock) {
         Where-Object { $_ -match '^\[ST|->|Error|Traceback' } |
         Out-File -Append -FilePath $log -Encoding utf8
 }
+# 15/30min 日内均值回归 (IMR): 先采集最新bar, 再评估 (首次自动冻结; 公共行情免密钥)
+$imr = Join-Path $root "intraday_mr_research\scripts\run_intraday_mr.py"
+if (Test-Path $imr) {
+    "--- IMR 15/30min collect+evaluate ---" | Out-File -Append -FilePath $log -Encoding utf8
+    & $py $imr --mode collect 2>&1 |
+        Where-Object { $_ -match '新增|freeze|链校验|collect|Error|Traceback' } |
+        Out-File -Append -FilePath $log -Encoding utf8
+    & $py $imr --mode evaluate 2>&1 |
+        Where-Object { $_ -match 'IMR_|verdict|PENDING|KILL|PASS|Error|Traceback' } |
+        Out-File -Append -FilePath $log -Encoding utf8
+}
 "--- done $(Get-Date -Format o) ---" | Out-File -Append -FilePath $log -Encoding utf8
