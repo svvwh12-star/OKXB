@@ -410,9 +410,10 @@ class App:
                     )
                     if decision.action == RiskAction.APPROVE:
                         self._diag["entered"] += 1
+                        approved = decision.approved_notional_usdt   # 字段名修复: 原 .approved_notional 不存在
                         self._alert(f"下单意图 {inst} {sig.side.value} {sig.strategy.value} "
-                                    f"comp={sig.composite_score} 批准{decision.approved_notional}U")
-                        await self.executor.submit(sig, decision.approved_notional, is_strong)
+                                    f"comp={sig.composite_score} 批准{approved}U")
+                        await self.executor.submit(sig, approved, is_strong)
                         self._cooldown[inst] = time.time() * 1000.0 + self._cooldown_ms
                         break
                     elif decision.action != RiskAction.REJECT:
