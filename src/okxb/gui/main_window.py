@@ -15,6 +15,7 @@ from .. import paths
 from . import multiperiod
 from .controller import TOOLTIPS
 from .controller import (PARAM_DEFS, EngineController, account_brief_sync, ai_analyze_sync,
+                         ai_history_append, ai_history_recent,
                          ai_pick_sync, apply_calibration_sync, apply_params, calib_files_info,
                          current_params, delete_preset, get_preset, list_presets,
                          manual_bracket_sync, manual_cancel_all_sync, manual_close_all_sync,
@@ -597,12 +598,14 @@ class OKXBApp(ctk.CTk):
             res = ai_pick_sync(pool, rows)
 
             def done():
+                txt = res.get("text", "(无输出)")
                 box.configure(state="normal")
                 box.delete("1.0", "end")
-                box.insert("end", res.get("text", "(无输出)"))
+                box.insert("end", txt)
                 box.configure(state="disabled")
                 for p in res.get("picks", []) or []:
                     self._pick_row(listfr, p, win)
+                ai_history_append("AI选品", self.pick_pool.get(), txt)   # 持久化, 供『📜 AI历史』回看
             self.after(0, done)
         threading.Thread(target=work, daemon=True).start()
 
@@ -1085,6 +1088,8 @@ class OKXBApp(ctk.CTk):
                                           fg_color="#5a4bbf", state="disabled",
                                           command=self._import_ai)
         self.m_import_btn.pack(side="left", padx=3)
+        ctk.CTkButton(ra, text="📜 AI历史", font=FONT_B, width=92, fg_color="#3a6e5a",
+                      command=self._show_ai_history).pack(side="left", padx=3)
 
         # 数量
         r2 = ctk.CTkFrame(f, fg_color="transparent"); r2.pack(fill="x", pady=3, padx=8)
@@ -1324,13 +1329,34 @@ class OKXBApp(ctk.CTk):
             res = ai_analyze_sync(inst, row)
 
             def done():
-                self._m_set(res.get("text", "(无输出)"), clear=True)   # 只显示当前标的研判
+                txt = res.get("text", "(无输出)")
+                self._m_set(txt, clear=True)   # 只显示当前标的研判 (历史见『📜 AI历史』)
+                ai_history_append("单标的分析", inst, txt)     # 持久化, 解决"过一会找不到"
                 self._ai_last = res.get("struct")
                 if self._ai_last:
                     self._ai_last.setdefault("inst", inst)
                     self.m_import_btn.configure(state="normal")
             self.after(0, done)
         threading.Thread(target=work, daemon=True).start()
+
+    def _show_ai_history(self) -> None:
+        """回看最近的 AI 单标的研判 / 选品 (持久化到本机, 不会因刷新/重开而丢)。"""
+        win = ctk.CTkToplevel(self)
+        win.title("AI 历史 (最近 30 条)")
+        win.geometry("760x560")
+        win.transient(self)
+        ctk.CTkLabel(win, text="AI 历史 · 最新在最上 (本机持久保存, 信息聚合非投资建议)",
+                     font=FONT_B, anchor="w").pack(fill="x", padx=12, pady=(10, 4))
+        box = ctk.CTkTextbox(win, font=MONO)
+        box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        recs = ai_history_recent(30)
+        if not recs:
+            box.insert("end", "暂无历史 (点『AI分析此标的』或『AI选品』后会自动记录)。")
+        else:
+            for r in recs:
+                box.insert("end", f"━━ {r.get('ts','')} · {r.get('kind','')} · {r.get('inst','')} ━━\n")
+                box.insert("end", (r.get("text", "") or "") + "\n\n")
+        box.configure(state="disabled")
 
     def _import_ai(self, struct: dict = None) -> None:
         """把 AI 结构化建议填入下单区 (不下单)。struct=None 时用最近一次分析结果。"""

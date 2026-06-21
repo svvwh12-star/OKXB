@@ -92,9 +92,15 @@ class LLMClassifier:
         return self.model_hard if tier == "hard" else self.model_simple
 
     def _json_model(self) -> str:
-        """结构化 JSON 任务(选品/结构化研判)优先用【非推理】模型: 更快、直接吐 JSON。
-        推理模型(deepseek-v4-pro / reasoner / o系)会把答案埋进思维链, content 常空或被截断 → 解析不到。
-        故 model_hard 是推理模型时回退到 model_simple(flash); 自由文本深度分析仍用 model_hard(见 analyze)。"""
+        """结构化 JSON 任务(选品/结构化研判)的模型选择:
+        - 选型策略=pro: 强制用 model_hard(用户要更强模型; 靠 reasoning_content 回退 + 末尾JSON解析兜底)。
+        - 选型策略=flash: 用 model_simple。
+        - auto(默认): 推理模型(pro/reasoner/o系)会把答案埋进思维链、content 常空 → 回退 flash 更稳。
+        自由文本深度分析(analyze/analyze_market)始终用 model_hard。"""
+        if self.tier_policy == "pro":
+            return self.model_hard or self.model_simple
+        if self.tier_policy == "flash":
+            return self.model_simple or self.model_hard
         hard = (self.model_hard or "").lower()
         if any(k in hard for k in ("pro", "reasoner", "think", "-r1", "o1", "o3")):
             return self.model_simple or self.model_hard
@@ -364,12 +370,21 @@ class LLMClassifier:
             d = await self._chat_json(self._json_model(), sysp, user, max_tokens=1600)
             picks = d.get("picks") if isinstance(d.get("picks"), list) else []
             valid_insts = {str(c.get("inst")) for c in candidates}   # 只认真实候选池
+            by_base = {}                                  # base -> 候选池全名 (机会分最高者作代表)
+            for c in candidates:
+                inst0 = str(c.get("inst", ""))
+                by_base.setdefault(inst0.split("-")[0].upper(), inst0)
+
+            def _resolve(raw):                           # 容错: AI 写 "MET"/"MET-USDT" -> 候选池全名
+                t = str(raw).strip().upper()
+                return t if t in valid_insts else by_base.get(t.split("-")[0])
             clean = []
             dropped = []
             for p in picks[:8]:
                 if not isinstance(p, dict) or not p.get("inst"):
                     continue
-                if str(p["inst"]) not in valid_insts:    # 拦截 AI 杜撰/写错的标的(如 BEAT-USDT-SWAP)
+                inst = _resolve(p["inst"])
+                if not inst:                             # 真不在候选池(杜撰)才丢弃
                     dropped.append(str(p["inst"]))
                     continue
                 if len(clean) >= 5:
@@ -379,7 +394,7 @@ class LLMClassifier:
                 except (TypeError, ValueError):
                     lv = 5
                 clean.append({
-                    "inst": str(p["inst"]),
+                    "inst": inst,
                     "direction": p.get("direction") if p.get("direction") in ("long", "short") else "long",
                     "strategy": str(p.get("strategy", ""))[:20],
                     "leverage": lv,
@@ -573,7 +588,11 @@ def _render_analysis(inst: str, s: dict, qctx: dict) -> str:
 
 def _render_picks(pool_label: str, picks: list, note: str) -> str:
     if not picks:
-        return f"[{pool_label}] AI 未给出推荐。"
+        if note:
+            return f"[{pool_label}] AI 未给出推荐。\n说明: {note}"
+        return (f"[{pool_label}] AI 未给出推荐 (模型未返回有效结构, 或判定当前候选无明显机会)。\n"
+                "排查: ①在『账户与密钥』把『选型策略』设为『自动』或『flash』再试 (pro 推理模型有时不吐 JSON);\n"
+                "②候选多为弱信号/无24h数据时本就可能空; ③点『验证AI』确认模型连通。")
     lines = [f"【AI 选品 · {pool_label}】(基于实时信号分+交易所24h真实涨跌+带出处的外部资讯简报; "
              "不含裸社媒)"]
     for i, p in enumerate(picks, 1):
@@ -590,7 +609,8 @@ def _render_picks(pool_label: str, picks: list, note: str) -> str:
 
 
 def _parse_json(content: str) -> dict:
-    """从模型返回中稳健解析 JSON (容忍 ```json 围栏、前后多余文字、reasoning 模型混入)。"""
+    """从模型返回中稳健解析 JSON (容忍 ```json 围栏、前后多余文字、reasoning 模型混入)。
+    扫描所有顶层平衡 {...}, 返回【最后一个】能解析的 —— 推理模型常把最终答案放在思维链末尾。"""
     if not content:
         return {}
     s = content.strip()
@@ -601,17 +621,21 @@ def _parse_json(content: str) -> dict:
         return json.loads(s)
     except (ValueError, TypeError):
         pass
-    start = s.find("{")                           # 提取首个平衡的 {...} (比贪婪正则稳健)
-    if start >= 0:
-        depth = 0
-        for i in range(start, len(s)):
-            if s[i] == "{":
-                depth += 1
-            elif s[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(s[start:i + 1])
-                    except (ValueError, TypeError):
-                        break
-    return {}
+    best: dict = {}
+    depth = 0
+    start = -1
+    for i, ch in enumerate(s):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                try:
+                    obj = json.loads(s[start:i + 1])
+                    if isinstance(obj, dict):
+                        best = obj            # 留最后一个可解析的顶层对象
+                except (ValueError, TypeError):
+                    pass
+    return best

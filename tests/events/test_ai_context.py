@@ -6,6 +6,7 @@ source + timestamp, and that optional feeds stay dormant (return []) when unconf
 import asyncio
 
 from okxb.events import coingecko, cryptonews, econ_calendar, stocknews
+from okxb.events.llm_classifier import LLMClassifier, _parse_json, _render_picks
 from okxb.events.provenance import (Evidence, fmt_age, fmt_data_age, fmt_eta,
                                      render_brief, render_schedule, stamp)
 
@@ -148,3 +149,34 @@ def test_stocknews_disabled_returns_empty():
 def test_stocknews_rfc822_parser():
     assert stocknews._rfc822_ms("Sat, 20 Jun 2026 12:00:00 GMT") is not None
     assert stocknews._rfc822_ms("nope") is None
+
+
+# ----------------- llm json parsing + selection robustness + tier policy -----------------
+
+def test_parse_json_prefers_last_object():
+    # reasoning-style: prose + early placeholder object, then the real answer last
+    s = ('thinking... {"picks": []} 继续推理 '
+         '{"picks": [{"inst":"BTC-USDT-SWAP"}], "note":"ok"}')
+    d = _parse_json(s)
+    assert d.get("note") == "ok" and len(d.get("picks")) == 1
+
+
+def test_parse_json_fenced_and_garbage():
+    assert _parse_json('```json\n{"a": 1}\n```') == {"a": 1}
+    assert _parse_json("no json at all") == {}
+
+
+def test_render_picks_empty_surfaces_reason():
+    out = _render_picks("加密永续", [], "市场不确定, 不推荐")
+    assert "未给出推荐" in out and "市场不确定" in out
+    out2 = _render_picks("加密永续", [], "")
+    assert "未给出推荐" in out2 and "选型策略" in out2     # 无 note 时给排查提示
+
+
+def test_json_model_respects_tier_policy():
+    pro = LLMClassifier("deepseek", "k", "", "flash-m", "pro-m", tier_policy="pro")
+    assert pro._json_model() == "pro-m"
+    flash = LLMClassifier("deepseek", "k", "", "flash-m", "pro-m", tier_policy="flash")
+    assert flash._json_model() == "flash-m"
+    auto = LLMClassifier("deepseek", "k", "", "flash-m", "pro-reasoner", tier_policy="auto")
+    assert auto._json_model() == "flash-m"                # auto: 推理模型回退 flash

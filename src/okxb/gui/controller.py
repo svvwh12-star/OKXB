@@ -416,6 +416,46 @@ def _run_obj(coro):
         return {"text": f"操作失败: {e!r}", "struct": None, "picks": []}
 
 
+# ----------------- AI 历史 (持久化, 供回看; 解决"结果过一会找不到") -----------------
+def _ai_history_path():
+    return paths.data_path("ai_history.jsonl")
+
+
+def ai_history_append(kind: str, inst: str, text: str) -> None:
+    """把一次 AI 研判/选品结果追加到本机历史 (带时间戳); 失败不抛。"""
+    import datetime as _dt
+    try:
+        p = _ai_history_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+               "kind": kind, "inst": inst or "", "text": text or ""}
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        lines = p.read_text(encoding="utf-8").splitlines()
+        if len(lines) > 200:                     # 仅保留最近 200 条, 防文件无限增长
+            p.write_text("\n".join(lines[-200:]) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def ai_history_recent(limit: int = 30) -> list:
+    """返回最近 limit 条 AI 历史 (最新在前)。"""
+    p = _ai_history_path()
+    if not p.exists():
+        return []
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+        out = []
+        for ln in lines[-limit:]:
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                pass
+        return list(reversed(out))
+    except Exception:
+        return []
+
+
 async def _get_spec(rest, inst_id):
     from ..exchange.okx_rest import OkxError
     try:
