@@ -51,6 +51,7 @@ class StrategyId(str, Enum):
     HFR80 = "hfr80_reversion"
     BASIS = "basis_meanrev"
     BREAKOUT = "breakout_taker"
+    RECONCILED = "reconciled"          # 对账重建的孤儿仓 (交易所有/本地无 -> 接管管理)
 
 
 class RiskAction(str, Enum):

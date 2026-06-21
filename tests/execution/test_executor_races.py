@@ -176,16 +176,16 @@ class SeqRest(FakeRest):
 
 def test_resolve_order_retries_filled_but_zero():
     rest = SeqRest([{"state": "filled", "accFillSz": "0"},                  # settle lag: inconsistent
-                    {"state": "filled", "accFillSz": "5", "avgPx": "100"}])  # then populated
+                    {"state": "filled", "accFillSz": "5", "avgPx": "100", "fee": "-0.3"}])  # then populated
     ex = _ex(rest)
-    state, filled, avg = asyncio.run(ex._resolve_order("BTC-USDT-SWAP", "x", retries=4, delay_s=0.0))
-    assert state == "filled" and filled == Decimal("5") and avg == Decimal("100")
+    state, filled, avg, fee = asyncio.run(ex._resolve_order("BTC-USDT-SWAP", "x", retries=4, delay_s=0.0))
+    assert state == "filled" and filled == Decimal("5") and avg == Decimal("100") and fee == Decimal("-0.3")
 
 
 def test_resolve_order_canceled_is_terminal_no_fill():
     rest = FakeRest(get_default={"state": "canceled", "accFillSz": "0"})
     ex = _ex(rest)
-    state, filled, avg = asyncio.run(ex._resolve_order("BTC-USDT-SWAP", "x", retries=4, delay_s=0.0))
+    state, filled, avg, fee = asyncio.run(ex._resolve_order("BTC-USDT-SWAP", "x", retries=4, delay_s=0.0))
     assert state == "canceled" and filled == Decimal("0") and avg is None
 
 
@@ -226,8 +226,27 @@ def test_close_full_removes_position():
     ex._om.add_position(pos)
     asyncio.run(ex.close_position(pos, "止损", Decimal("100")))
     assert ex._om.get("BTC-USDT-SWAP") is None              # fully closed -> removed
-    assert "TP1" in rest.canceled                           # TP order canceled
+    assert "TP1" in rest.canceled                           # TP order canceled (only after full close)
     assert rest.canceled_algos                              # SL algo canceled
+
+
+def test_close_uses_real_fee_when_present():
+    # exit fee from get_order.fee + entry fee per contract -> net PnL (not the rate estimate)
+    rest = FakeRest(get_default={"state": "filled", "accFillSz": "5", "avgPx": "100", "fee": "-0.25"})
+    ex = _ex(rest)
+    pos = _pos("5", entry_fee_per_contract=Decimal("-0.02"))
+    ex._om.add_position(pos)
+    asyncio.run(ex.close_position(pos, "止损", Decimal("100")))
+    # gross=(100-100)*5*0.01=0; entry_fee_slice=-0.02*5=-0.10; exit_fee=-0.25 -> net=-0.35
+    assert abs(ex._risk.total_pnl - (-0.35)) < 1e-9
+
+
+def test_close_noop_when_not_managed():
+    rest = FakeRest(get_default={"state": "filled", "accFillSz": "5", "avgPx": "100"})
+    ex = _ex(rest)
+    pos = _pos("5")                                         # NOT added to _om
+    asyncio.run(ex.close_position(pos, "止损", Decimal("100")))
+    assert not rest.placed                                  # lock-wrapper guard: unmanaged -> no order
 
 
 def test_close_reject_keeps_position():
@@ -283,10 +302,21 @@ def test_reconcile_arms_orphan_stop_idempotent():
     real = [{"instId": "BTC-USDT-SWAP", "pos": "5", "avgPx": "100"}]
     asyncio.run(ex.reconcile_positions(real))
     assert len(rest.algos) == 1                          # protective reduce-only SL placed
-    assert "BTC-USDT-SWAP" in ex._orphan_armed
+    assert ex._om.has("BTC-USDT-SWAP")                   # now also managed
     assert _has(ex._store.audits, "orphan_protected")
-    asyncio.run(ex.reconcile_positions(real))            # idempotent: no second arm
+    asyncio.run(ex.reconcile_positions(real))            # idempotent: now managed -> no second arm
     assert len(rest.algos) == 1
+
+
+def test_reconcile_rebuilds_managed_orphan():
+    rest = FakeRest()
+    ex = _ex(rest)
+    asyncio.run(ex.reconcile_positions([{"instId": "BTC-USDT-SWAP", "pos": "5", "avgPx": "100"}]))
+    pos = ex._om.get("BTC-USDT-SWAP")
+    assert pos is not None
+    assert pos.strategy == StrategyId.RECONCILED         # rebuilt lifecycle, not just a bare stop
+    assert pos.contracts == Decimal("5") and pos.entry_px == Decimal("100")
+    assert pos.sl_algo_oid == "A1"                       # armed protective stop recorded on the position
 
 
 def test_reconcile_skips_managed():

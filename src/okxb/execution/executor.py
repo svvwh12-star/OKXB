@@ -17,7 +17,7 @@ from decimal import Decimal
 from typing import Optional
 
 from ..config import Config
-from ..core.enums import OrderType, PosSide, Side
+from ..core.enums import OrderType, PosSide, Side, StrategyId
 from ..core.models import Signal
 from ..exchange.instruments import InstrumentCache
 from ..exchange.okx_rest import OkxError, OkxRestClient
@@ -74,6 +74,7 @@ class Executor:
         self._orphan_sl_frac = float(config.get("execution.orphan_stop_pct", 1.0)) / 100.0
         self._bg_tasks: set = set()            # H-8: 持引用防 GC + 捕获 fire-and-forget 任务异常
         self._orphan_armed: set = set()        # 已为之补挂保护止损的孤儿仓 (防每轮重复挂)
+        self._close_locks: dict = {}           # Opt-3: per-仓平仓串行锁
 
     def _ps(self, pos_dir: Side) -> str:
         """持仓方向 -> posSide。单向=net; 双向: 多=long 空=short。"""
@@ -140,10 +141,17 @@ class Executor:
                     return {"ordId": None, "sCode": "0", "_deduped": True}
             raise
 
+    @staticmethod
+    def _fee_of(o: dict) -> Decimal:
+        try:
+            return Decimal(str(o.get("fee", "0") or "0"))   # OKX: 负=已扣手续费, 正=返佣
+        except Exception:  # noqa: BLE001
+            return Decimal("0")
+
     async def _resolve_order(self, inst: str, cl_oid: str, *, retries: int = 3,
-                             delay_s: float = 0.15) -> tuple[str, Decimal, Optional[Decimal]]:
+                             delay_s: float = 0.15) -> tuple[str, Decimal, Optional[Decimal], Decimal]:
         """H-7c 查订单最终态; 对 accFillSz 暂为 0 (IOC 结算延迟) 做有界重试。
-        返回 (state, accFillSz, avg_px); 全部查询失败返回 ('unknown', 0, None) 供调用方挂对账。"""
+        返回 (state, accFillSz, avg_px, fee); 全部查询失败返回 ('unknown', 0, None, 0) 供调用方挂对账。"""
         state = "unknown"
         for i in range(max(1, retries)):
             try:
@@ -155,13 +163,13 @@ class Executor:
                 filled = Decimal(o.get("accFillSz", "0") or "0")
                 avg = o.get("avgPx")
                 if filled > 0:
-                    return state, filled, (Decimal(avg) if avg else None)
+                    return state, filled, (Decimal(avg) if avg else None), self._fee_of(o)
                 if state == "canceled":
-                    return state, Decimal("0"), None      # 终态无成交
+                    return state, Decimal("0"), None, self._fee_of(o)   # 终态无成交
                 # state=filled 但 accFillSz 暂为 0 (结算延迟) 或仍 live -> 继续重试
             if i < retries - 1:
                 await asyncio.sleep(delay_s)
-        return state, Decimal("0"), None
+        return state, Decimal("0"), None, Decimal("0")
 
     async def _persist_risk(self) -> None:
         try:                                   # C-4: 风控状态落盘; 失败不得影响主流程
@@ -224,9 +232,9 @@ class Executor:
         })
         if sig.taker:
             # IOC: 立即成交或取消; 有界重试查回成交(防 accFillSz 结算延迟漏建仓)后建仓
-            state, filled, avg = await self._resolve_order(inst, cl_oid)
+            state, filled, avg, fee = await self._resolve_order(inst, cl_oid)
             if filled > 0 or state in ("filled", "partially_filled"):
-                await self._open_managed(inst, sig, filled or contracts, avg or Decimal(str(px)))
+                await self._open_managed(inst, sig, filled or contracts, avg or Decimal(str(px)), entry_fee=fee)
             elif state != "canceled":
                 # 非干净撤销 (unknown / 仍 live 且未拿到成交) -> 挂对账, 绝不静默丢弃可能已成交的单
                 await self._store.audit("taker_reconcile_needed",
@@ -237,9 +245,9 @@ class Executor:
 
     async def _ttl_watch(self, inst, cl_oid, sig, contracts, px, ttl_s) -> None:
         await asyncio.sleep(ttl_s)
-        state, filled, avg = await self._resolve_order(inst, cl_oid)
+        state, filled, avg, fee = await self._resolve_order(inst, cl_oid)
         if state == "filled" or filled > 0:
-            await self._open_managed(inst, sig, filled or contracts, avg or Decimal(str(px)))
+            await self._open_managed(inst, sig, filled or contracts, avg or Decimal(str(px)), entry_fee=fee)
             return
         if state in ("live", "partially_filled"):
             try:
@@ -248,15 +256,16 @@ class Executor:
             except OkxError as e:
                 await self._store.audit("ttl_cancel_fail", f"{inst} {cl_oid} {e}")
             # H-7b 撤单与成交可能同时发生 -> 撤单后再查【权威最终成交】, 据此建仓, 杜绝悬挂裸仓
-            state2, filled2, avg2 = await self._resolve_order(inst, cl_oid)
+            state2, filled2, avg2, fee2 = await self._resolve_order(inst, cl_oid)
             if filled2 > 0 or state2 == "filled":
-                await self._open_managed(inst, sig, filled2 or contracts, avg2 or Decimal(str(px)))
+                await self._open_managed(inst, sig, filled2 or contracts, avg2 or Decimal(str(px)), entry_fee=fee2)
         elif state == "unknown":
             await self._store.audit("ttl_reconcile_needed", f"{inst} {cl_oid} 状态未知, 待对账")
 
     # ----------------- 持仓与退出 -----------------
 
-    async def _open_managed(self, inst, sig: Signal, contracts: Decimal, entry_px: Decimal) -> None:
+    async def _open_managed(self, inst, sig: Signal, contracts: Decimal, entry_px: Decimal,
+                            entry_fee: Decimal = Decimal("0")) -> None:
         sign = 1 if sig.side == Side.BUY else -1
         sl_px = entry_px * Decimal(str(1 - sign * sig.sl_pct))
         tp_px = entry_px * Decimal(str(1 + sign * sig.tp_pct))
@@ -265,11 +274,13 @@ class Executor:
         tp_px = round_price(float(tp_px), tick, side_up=(sig.side == Side.BUY))
         ctval = self._inst.ct_val(inst)
         max_loss = Decimal(str(sig.sl_pct)) * entry_px * contracts * Decimal(str(ctval))
+        fee_pc = (Decimal(str(entry_fee)) / contracts) if contracts > 0 else Decimal("0")   # 入场费/张
 
         pos = ManagedPosition(
             inst_id=inst, side=sig.side, contracts=contracts, entry_px=entry_px,
             sl_px=sl_px, tp_px=tp_px, strategy=sig.strategy, signal_id=sig.signal_id,
             entry_ms=int(time.time() * 1000), max_loss_usdt=max_loss,
+            entry_fee_per_contract=fee_pc,
         )
         # 止盈: reduce-only 限价 (交易所托管)
         exit_side = Side.SELL if sig.side == Side.BUY else Side.BUY
@@ -360,13 +371,18 @@ class Executor:
             return True
         return False
 
-    def _net_pnl(self, pos: ManagedPosition, fill_px: Decimal, filled: Decimal) -> float:
-        """已实现【净】盈亏 = 毛 − 往返手续费估计 (H-9: 喂熔断账目不偏乐观)。"""
+    def _net_pnl(self, pos: ManagedPosition, fill_px: Decimal, filled: Decimal,
+                 exit_fee: Decimal = Decimal("0")) -> float:
+        """已实现【净】盈亏 (H-9): 毛 + 真实手续费 (入场摊到本片 + 本次出场, OKX fee 负=已扣)。
+        无真实手续费时(演练/接口未返回)退回往返费率估计。"""
         sign = 1 if pos.side == Side.BUY else -1
         ctval = Decimal(str(self._inst.ct_val(pos.inst_id)))
         gross = float((fill_px - pos.entry_px) * sign * filled * ctval)
-        fee = abs(float(fill_px) * float(filled) * float(ctval)) * self._fee_roundtrip
-        return gross - fee
+        actual_fee = float(pos.entry_fee_per_contract * filled) + float(exit_fee)
+        if actual_fee != 0.0:
+            return gross + actual_fee                  # 真实费用 (负值 -> 扣减)
+        est = abs(float(fill_px) * float(filled) * float(ctval)) * self._fee_roundtrip
+        return gross - est
 
     async def _cancel_protection(self, pos: ManagedPosition) -> None:
         if pos.tp_order_oid:
@@ -380,7 +396,21 @@ class Executor:
             except OkxError:
                 pass
 
+    def _close_lock(self, inst: str) -> asyncio.Lock:
+        lk = self._close_locks.get(inst)
+        if lk is None:
+            lk = asyncio.Lock()
+            self._close_locks[inst] = lk
+        return lk
+
     async def close_position(self, pos: ManagedPosition, reason: str, mid: Decimal) -> None:
+        # Opt-3: per-仓串行锁, 固化"同一仓不并发双平"不变量 (当前确为串行, 防未来 WS 驱动并发引入双平)
+        async with self._close_lock(pos.inst_id):
+            if not self._om.has(pos.inst_id):
+                return                         # 已被并发的另一次平仓处理掉
+            await self._close_impl(pos, reason, mid)
+
+    async def _close_impl(self, pos: ManagedPosition, reason: str, mid: Decimal) -> None:
         pos.closing = True
         exit_side = Side.SELL if pos.side == Side.BUY else Side.BUY
 
@@ -409,14 +439,14 @@ class Executor:
             pos.closing = False                # 下单失败 -> 保持持仓+原保护, 下拍重试; 绝不假装已平
             return
 
-        state, filled, avg = await self._resolve_order(pos.inst_id, cl)
+        state, filled, avg, exit_fee = await self._resolve_order(pos.inst_id, cl)
         if filled <= 0:                        # 未成交: 保留持仓+原 SL/TP (幽灵仓由 reconcile_positions 兜底清理)
             await self._store.audit("close_unfilled", f"{pos.inst_id} 平仓IOC未成交(state={state}), 保持持仓+原止损待重试")
             pos.closing = False
             return
         fill_px = avg or mid                   # H-9: 用真实成交价算 PnL
         if filled < pos.contracts:             # 部分成交: 记分片(非终态不动连亏), 留剩余量, 原 SL/TP 仍守护
-            pnl = self._net_pnl(pos, fill_px, filled)
+            pnl = self._net_pnl(pos, fill_px, filled, exit_fee)
             self._risk.register_close(pnl, final=False)
             await self._persist_risk()
             await self._store.record_pnl(pos.inst_id, pos.strategy.value, pnl,
@@ -428,7 +458,7 @@ class Executor:
             return
         # 全部成交 -> 此时才撤交易所端 TP/SL (先前不撤, 故部分成交不会裸仓)
         await self._cancel_protection(pos)
-        pnl = self._net_pnl(pos, fill_px, filled)
+        pnl = self._net_pnl(pos, fill_px, filled, exit_fee)
         self._risk.register_close(pnl, final=True)
         await self._persist_risk()
         await self._store.record_pnl(pos.inst_id, pos.strategy.value, pnl,
@@ -449,7 +479,7 @@ class Executor:
             inst = p.get("instId")
             if inst and abs(float(p.get("pos") or 0)) > 0:
                 real[inst] = p
-        # 1) 孤儿仓 -> 补挂保护止损
+        # 1) 孤儿仓 -> 补挂保护止损 + Opt-2: 重建完整 ManagedPosition 纳入本地监控
         for inst, p in real.items():
             if self._om.has(inst) or inst in self._orphan_armed:
                 continue
@@ -459,16 +489,27 @@ class Executor:
                 sz = abs(float(p.get("pos") or 0))
                 if avg <= 0:
                     continue
+                tick = self._inst.tick_sz(inst)
+                side = Side.BUY if long else Side.SELL
                 sl_raw = avg * (1 - self._orphan_sl_frac) if long else avg * (1 + self._orphan_sl_frac)
-                sl_px = round_price(sl_raw, self._inst.tick_sz(inst), side_up=(not long))
-                await self._rest.place_algo_order(
+                sl_px = round_price(sl_raw, tick, side_up=(not long))
+                tp_raw = avg * (1 + 2 * self._orphan_sl_frac) if long else avg * (1 - 2 * self._orphan_sl_frac)
+                tp_px = round_price(tp_raw, tick, side_up=long)
+                algo = await self._rest.place_algo_order(
                     inst_id=inst, td_mode=self._td_mode, side=(Side.SELL if long else Side.BUY).value,
                     sz=str(sz), pos_side=("net" if self._pm == "net_mode" else ("long" if long else "short")),
                     reduce_only=(self._pm == "net_mode"),
                     sl_trigger_px=str(sl_px), sl_ord_px="-1", trigger_px_type="last")
+                # 重建受管持仓 -> monitor_positions(本地SL+时间止损) + 信号出场 接管该仓; 用真实入场均价/时间
+                ctime = int(p.get("cTime") or 0) or int(time.time() * 1000)
+                self._om.add_position(ManagedPosition(
+                    inst_id=inst, side=side, contracts=Decimal(str(sz)), entry_px=Decimal(str(avg)),
+                    sl_px=sl_px, tp_px=tp_px, strategy=StrategyId.RECONCILED,
+                    signal_id=f"orphan{inst}{ctime}", entry_ms=ctime, max_loss_usdt=Decimal("0"),
+                    sl_algo_oid=(algo.get("algoId") if isinstance(algo, dict) else None)))
                 self._orphan_armed.add(inst)
-                await self._store.audit("orphan_protected", f"{inst} 未追踪仓 sz={sz}@{avg} 补挂止损@{sl_px}")
-                self._alert(f"⚠ 发现未追踪持仓 {inst} sz={sz}@{avg}, 已补挂交易所端止损@{sl_px} (请人工核查来源)")
+                await self._store.audit("orphan_protected", f"{inst} 未追踪仓 sz={sz}@{avg} 补挂止损@{sl_px} 并接管管理")
+                self._alert(f"⚠ 发现未追踪持仓 {inst} sz={sz}@{avg}, 已补挂止损@{sl_px} 并纳入本地监控 (请人工核查来源)")
             except OkxError as e:
                 await self._store.audit("orphan_protect_fail", f"{inst} {e}")
         # 2) 幽灵仓 -> 清理本地 (加 age 守护, 避免误删快照尚未反映的新仓)
