@@ -29,6 +29,7 @@ class ManagedPosition:
     closing: bool = False
     hwm: float = 0.0           # 最高/最低水位 (移动止盈用)
     rev_run: int = 0           # 反转/衰减 连续拍计数
+    close_attempts: int = 0    # 平仓尝试次数 (每次用不同 clOrdId, 防重发被去重 + 支持部分成交重试)
 
 
 class OrderManager:

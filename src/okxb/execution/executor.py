@@ -78,13 +78,55 @@ class Executor:
         return self._pm == "net_mode"      # 双向模式由 posSide 决定平仓, 不传 reduceOnly
 
     async def _place(self, **kw) -> dict:
-        """优先 WS 下单 (低延迟), 失败回落 REST。"""
+        """优先 WS 下单 (低延迟), 失败回落 REST。
+        H-7a 防双发: WS 可能已把单送达交易所只是回执失败 -> 回落 REST 用【同一 clOrdId】重发,
+        交易所按 clOrdId 幂等, 重复会回 51016 -> 据此适配为"订单已存在", 绝不产生双仓。"""
+        cl = kw.get("cl_ord_id")
         if self._ws_order is not None and getattr(self._ws_order, "logged_in", False):
             try:
                 return await self._ws_order.place_order(**kw)
             except OkxError as e:
                 await self._store.audit("ws_place_fallback", repr(e))
-        return await self._rest.place_order(**kw)
+        try:
+            return await self._rest.place_order(**kw)
+        except OkxError as e:
+            if cl and ("51016" in str(e) or "duplicat" in str(e).lower()):
+                await self._store.audit("place_dedup", f"{kw.get('inst_id')} {cl} 重复clOrdId -> 适配已存在单")
+                try:
+                    o = await self._rest.get_order(kw["inst_id"], cl_ord_id=cl)
+                    return {"ordId": o.get("ordId"), "sCode": "0", "_deduped": True}
+                except OkxError:
+                    return {"ordId": None, "sCode": "0", "_deduped": True}
+            raise
+
+    async def _resolve_order(self, inst: str, cl_oid: str, *, retries: int = 3,
+                             delay_s: float = 0.15) -> tuple[str, Decimal, Optional[Decimal]]:
+        """H-7c 查订单最终态; 对 accFillSz 暂为 0 (IOC 结算延迟) 做有界重试。
+        返回 (state, accFillSz, avg_px); 全部查询失败返回 ('unknown', 0, None) 供调用方挂对账。"""
+        state = "unknown"
+        for i in range(max(1, retries)):
+            try:
+                o = await self._rest.get_order(inst, cl_ord_id=cl_oid)
+            except OkxError:
+                o = None
+            if o:
+                state = o.get("state") or state
+                filled = Decimal(o.get("accFillSz", "0") or "0")
+                avg = o.get("avgPx")
+                if filled > 0:
+                    return state, filled, (Decimal(avg) if avg else None)
+                if state == "canceled":
+                    return state, Decimal("0"), None      # 终态无成交
+                # state=filled 但 accFillSz 暂为 0 (结算延迟) 或仍 live -> 继续重试
+            if i < retries - 1:
+                await asyncio.sleep(delay_s)
+        return state, Decimal("0"), None
+
+    async def _persist_risk(self) -> None:
+        try:                                   # C-4: 风控状态落盘; 失败不得影响主流程
+            await self._store.set_kv("risk_state", self._risk.to_state())
+        except Exception:                      # noqa: BLE001
+            pass
 
     # ----------------- 入场 -----------------
 
@@ -140,39 +182,35 @@ class Executor:
             "filled_sz": "0", "avg_px": None, "json": {"comp": sig.composite_score},
         })
         if sig.taker:
-            # IOC: 立即成交或取消; 查回成交后建仓 (无需 TTL)
-            try:
-                o = await self._rest.get_order(inst, cl_ord_id=cl_oid)
-                filled = Decimal(o.get("accFillSz", "0") or "0")
-                if filled > 0:
-                    await self._open_managed(inst, sig, filled,
-                                             Decimal(o.get("avgPx", str(px)) or str(px)))
-            except OkxError:
-                pass
+            # IOC: 立即成交或取消; 有界重试查回成交(防 accFillSz 结算延迟漏建仓)后建仓
+            state, filled, avg = await self._resolve_order(inst, cl_oid)
+            if filled > 0:
+                await self._open_managed(inst, sig, filled, avg or Decimal(str(px)))
+            elif state == "unknown":
+                await self._store.audit("taker_reconcile_needed",
+                                        f"{inst} {cl_oid} IOC 成交未知, 待对账 (避免漏建裸仓)")
         else:
             ttl = (self._ttl_min + self._ttl_max) / 2 / 1000.0
             asyncio.create_task(self._ttl_watch(inst, cl_oid, sig, contracts, px, ttl))
 
     async def _ttl_watch(self, inst, cl_oid, sig, contracts, px, ttl_s) -> None:
         await asyncio.sleep(ttl_s)
-        try:
-            o = await self._rest.get_order(inst, cl_ord_id=cl_oid)
-        except OkxError:
-            return
-        state = o.get("state")
-        filled = Decimal(o.get("accFillSz", "0") or "0")
+        state, filled, avg = await self._resolve_order(inst, cl_oid)
         if state == "filled" or filled > 0:
-            entry_px = Decimal(o.get("avgPx", str(px)) or str(px))
-            await self._open_managed(inst, sig, filled or contracts, entry_px)
-        elif state in ("live", "partially_filled"):
+            await self._open_managed(inst, sig, filled or contracts, avg or Decimal(str(px)))
+            return
+        if state in ("live", "partially_filled"):
             try:
                 await self._rest.cancel_order(inst, cl_ord_id=cl_oid)
                 await self._store.audit("ttl_cancel", f"{inst} {cl_oid} 未成交撤单")
-            except OkxError:
-                pass
-            if filled > 0:
-                entry_px = Decimal(o.get("avgPx", str(px)) or str(px))
-                await self._open_managed(inst, sig, filled, entry_px)
+            except OkxError as e:
+                await self._store.audit("ttl_cancel_fail", f"{inst} {cl_oid} {e}")
+            # H-7b 撤单与成交可能同时发生 -> 撤单后再查【权威最终成交】, 据此建仓, 杜绝悬挂裸仓
+            state2, filled2, avg2 = await self._resolve_order(inst, cl_oid)
+            if filled2 > 0 or state2 == "filled":
+                await self._open_managed(inst, sig, filled2 or contracts, avg2 or Decimal(str(px)))
+        elif state == "unknown":
+            await self._store.audit("ttl_reconcile_needed", f"{inst} {cl_oid} 状态未知, 待对账")
 
     # ----------------- 持仓与退出 -----------------
 
@@ -282,40 +320,64 @@ class Executor:
 
     async def close_position(self, pos: ManagedPosition, reason: str, mid: Decimal) -> None:
         pos.closing = True
-        exit_side = Side.SELL if pos.side == Side.BUY else Side.BUY
-        if not self.dry_run:
-            # 撤未成交止盈单
-            if pos.tp_order_oid:
-                try:
-                    await self._rest.cancel_order(pos.inst_id, ord_id=pos.tp_order_oid)
-                except OkxError:
-                    pass
-            # 撤交易所端止损 algo (否则平仓后残留一张 reduce-only 委托)
-            if pos.sl_algo_oid:
-                try:
-                    await self._rest.cancel_algos([{"algoId": pos.sl_algo_oid, "instId": pos.inst_id}])
-                except OkxError:
-                    pass
-            try:
-                await self._rest.place_order(
-                    inst_id=pos.inst_id, td_mode=self._td_mode, side=exit_side.value,
-                    ord_type=OrderType.OPTIMAL_LIMIT_IOC.value, sz=str(pos.contracts),
-                    pos_side=self._ps(pos.side), reduce_only=self._exit_reduce,
-                    cl_ord_id=_clean_oid(pos.signal_id + "cl"),
-                )
-            except OkxError as e:
-                await self._store.audit("close_reject", f"{pos.inst_id} {e}")
-        # 估算已实现盈亏 (用 mid 近似)
         sign = 1 if pos.side == Side.BUY else -1
-        pnl = float((mid - pos.entry_px) * sign * pos.contracts
-                    * Decimal(str(self._inst.ct_val(pos.inst_id))))
+        ctval = Decimal(str(self._inst.ct_val(pos.inst_id)))
+        exit_side = Side.SELL if pos.side == Side.BUY else Side.BUY
+
+        if self.dry_run:                       # 演练: 用 mid 估算, 直接记账平仓
+            pnl = float((mid - pos.entry_px) * sign * pos.contracts * ctval)
+            self._risk.register_close(pnl)
+            await self._persist_risk()
+            await self._store.record_pnl(pos.inst_id, pos.strategy.value, pnl, {"reason": reason, "dry": True})
+            self._om.remove_position(pos.inst_id)
+            self._alert(f"⛔ 平仓(演练) {pos.inst_id} {reason} pnl~{pnl:.3f}U")
+            return
+
+        # 撤未成交止盈单 + 交易所端止损 algo (避免与平仓单并存)
+        if pos.tp_order_oid:
+            try:
+                await self._rest.cancel_order(pos.inst_id, ord_id=pos.tp_order_oid)
+            except OkxError:
+                pass
+        if pos.sl_algo_oid:
+            try:
+                await self._rest.cancel_algos([{"algoId": pos.sl_algo_oid, "instId": pos.inst_id}])
+            except OkxError:
+                pass
+
+        pos.close_attempts += 1                # 每次平仓用不同 clOrdId: 防重发去重 + 支持剩余量重试
+        cl = _clean_oid(f"cl{pos.close_attempts}{pos.signal_id}")
+        try:
+            await self._rest.place_order(
+                inst_id=pos.inst_id, td_mode=self._td_mode, side=exit_side.value,
+                ord_type=OrderType.OPTIMAL_LIMIT_IOC.value, sz=str(pos.contracts),
+                pos_side=self._ps(pos.side), reduce_only=self._exit_reduce, cl_ord_id=cl,
+            )
+        except OkxError as e:
+            await self._store.audit("close_reject", f"{pos.inst_id} {e}")
+            pos.closing = False                # H-7d 下单失败 -> 保持持仓, 下拍重试; 绝不假装已平
+            return
+
+        # H-7d 查实际成交: 只有【全部成交】才移除持仓; 部分成交记账并留剩余量; 零成交保持持仓重试。
+        # 此前无条件 register_close+remove -> 平仓单没打成也被当已离场 = 风控以为平了实则裸仓继续亏。
+        state, filled, avg = await self._resolve_order(pos.inst_id, cl)
+        if filled <= 0:
+            await self._store.audit("close_unfilled", f"{pos.inst_id} 平仓IOC未成交(state={state}), 保持持仓待重试")
+            pos.closing = False
+            return
+        fill_px = avg or mid                   # H-9: 用真实成交价算 PnL, 而非 mid 估算
+        pnl = float((fill_px - pos.entry_px) * sign * filled * ctval)
         self._risk.register_close(pnl)
-        try:                                   # C-4: 平仓即落盘风控状态, 崩溃也不丢硬停账目
-            await self._store.set_kv("risk_state", self._risk.to_state())
-        except Exception:                      # noqa: BLE001 持久化失败不得影响平仓主流程
-            pass
-        await self._store.record_pnl(pos.inst_id, pos.strategy.value, pnl, {"reason": reason})
-        await self._store.audit("closed", f"{pos.inst_id} {reason} pnl~{pnl:.3f}")
+        await self._persist_risk()
+        await self._store.record_pnl(pos.inst_id, pos.strategy.value, pnl,
+                                     {"reason": reason, "fill_px": str(fill_px), "filled": str(filled)})
+        if filled < pos.contracts:             # 部分成交: 记已平部分, 更新剩余, 保持持仓(下拍续平)
+            pos.contracts = pos.contracts - filled
+            pos.closing = False
+            await self._store.audit("close_partial", f"{pos.inst_id} 部分平{filled} 剩{pos.contracts}")
+            self._alert(f"⚠ 部分平仓 {pos.inst_id} {reason} 已平{filled} 剩{pos.contracts} pnl~{pnl:.3f}U")
+            return
+        await self._store.audit("closed", f"{pos.inst_id} {reason} pnl~{pnl:.3f} fill@{fill_px}")
         self._om.remove_position(pos.inst_id)
         self._alert(f"⛔ 平仓 {pos.inst_id} {reason} pnl~{pnl:.3f}U 状态={self._risk.system_state.value}")
 
