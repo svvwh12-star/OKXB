@@ -70,9 +70,29 @@ class LLMClassifier:
         self.provider = (provider or "rule").lower()
         self.api_key = api_key or ""
         self.base_url = (base_url or "https://api.deepseek.com").rstrip("/")
-        self.model_simple = model_simple or "deepseek-v4-flash"
-        self.model_hard = model_hard or "deepseek-v4-pro"
+        self.model_simple = model_simple or "deepseek-chat"
+        self.model_hard = model_hard or "deepseek-reasoner"
         self.tier_policy = (tier_policy or "auto").lower()
+        if self.provider == "deepseek":      # 纠正常见错误模型名(旧默认 v4-flash/-pro), 免用户手改 .env
+            self.model_simple = self._norm_ds(self.model_simple)
+            self.model_hard = self._norm_ds(self.model_hard)
+
+    @staticmethod
+    def _norm_ds(m: str) -> str:
+        """把无效/旧的 DeepSeek 模型名规整为官方名 (deepseek-chat / deepseek-reasoner)。"""
+        low = (m or "").strip().lower()
+        if low in ("deepseek-v4-flash", "deepseek-v3-flash", "deepseek-flash", "flash", ""):
+            return "deepseek-chat"
+        if low in ("deepseek-v4-pro", "deepseek-v3-pro", "deepseek-pro", "pro", "reasoner"):
+            return "deepseek-reasoner"
+        return m
+
+    @staticmethod
+    def _eff_tokens(model: str, mt: int) -> int:
+        """推理模型(reasoner/R1/o系)思维链吃 token; 给足额度, 否则正文被截断成空。"""
+        if any(k in (model or "").lower() for k in ("reasoner", "-r1", "o1", "o3", "think")):
+            return max(mt, 4000)
+        return mt
 
     @classmethod
     def from_secrets(cls, secrets) -> "LLMClassifier":
@@ -132,23 +152,38 @@ class LLMClassifier:
                 await client.messages.create(model=self.model_simple, max_tokens=8,
                                              messages=[{"role": "user", "content": "ping"}])
                 return f"Claude 连通 ✓\n模型(简单)={self.model_simple}"
-            url = f"{self.base_url}/chat/completions"
-            body = {"model": self.model_simple, "max_tokens": 8, "temperature": 0,
-                    "stream": False,
-                    "messages": [{"role": "user", "content": "只回复一个词: pong"}]}
-            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-            async with httpx.AsyncClient(timeout=20.0) as c:
-                r = await c.post(url, headers=headers, json=body)
-            if r.status_code != 200:
-                return f"{self.provider} 失败 ✗  HTTP {r.status_code}\n{r.text[:200]}"
-            data = r.json()
-            txt = (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "")[:40]
-            u = data.get("usage", {})
-            return (f"{self.provider} 连通 ✓\nBase URL={self.base_url}\n"
-                    f"简单任务模型={self.model_simple} (复杂={self.model_hard})\n"
-                    f"回复='{txt.strip()}'  用量={u}")
+            lines = [f"{self.provider} · Base URL={self.base_url} · 策略={self.tier_policy}"]
+            for tag, model in (("简单", self.model_simple), ("复杂", self.model_hard)):
+                lines.append(await self._probe_openai(tag, model))
+            lines.append("注: 若上面出现 HTTP 400/模型不存在 或『⚠空内容』, 多半是模型名写错 —— "
+                         "DeepSeek 正确名为 deepseek-chat / deepseek-reasoner。")
+            return "\n".join(lines)
         except Exception as e:
             return f"{self.provider} 连接异常 ✗\n{e!r}"
+
+    async def _probe_openai(self, tag: str, model: str) -> str:
+        url = f"{self.base_url}/chat/completions"
+        body = {"model": model, "max_tokens": 16, "temperature": 0, "stream": False,
+                "messages": [{"role": "user", "content": "只回复一个词: pong"}]}
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as c:
+                r = await c.post(url, headers=headers, json=body)
+        except Exception as e:
+            return f"  [{tag}] {model}: 连接异常 {e!r}"
+        if r.status_code != 200:
+            hint = " (模型名可能不存在?)" if (r.status_code == 400 or "model" in r.text.lower()) else ""
+            return f"  [{tag}] {model}: ✗ HTTP {r.status_code}{hint}  {r.text[:140]}"
+        try:
+            data = r.json()
+            ch = (data.get("choices") or [{}])[0]
+            msg = ch.get("message", {})
+            content = (msg.get("content") or msg.get("reasoning_content") or "")
+            ok = "✓" if content.strip() else "⚠空内容(模型名不对/被截断?)"
+            return (f"  [{tag}] {model}: {ok} 回复='{content.strip()[:30]}' "
+                    f"finish={ch.get('finish_reason', '')} 用量={data.get('usage', {})}")
+        except Exception as e:
+            return f"  [{tag}] {model}: 解析异常 {e!r}"
 
     async def classify(self, ticker: str, text: str, kind: str = "news",
                        items: str = "", tier: Optional[str] = None) -> dict:
@@ -168,6 +203,7 @@ class LLMClassifier:
     # ----------------- 通用对话 + AI 分析建议 -----------------
 
     async def _chat(self, model: str, system: str, user: str, max_tokens: int = 500) -> str:
+        max_tokens = self._eff_tokens(model, max_tokens)
         if self.provider == "claude":
             import anthropic
             c = anthropic.AsyncAnthropic(api_key=self.api_key)
@@ -206,6 +242,7 @@ class LLMClassifier:
 
     async def _chat_json(self, model: str, system: str, user: str, max_tokens: int = 800) -> dict:
         """要求模型返回 JSON 对象 (OpenAI 兼容用 response_format; Claude 直接解析)。"""
+        max_tokens = self._eff_tokens(model, max_tokens)
         if self.provider == "claude":
             txt = await self._chat(model, system + "\n只输出一个 JSON 对象, 不要多余文字。",
                                    user, max_tokens)
@@ -283,9 +320,17 @@ class LLMClassifier:
                 f"外部事件简报(只能引用这里、带来源与时间的条目, 不得编造其它):\n{evidence_text}\n\n"
                 f"只输出一个 JSON 对象: {schema}")
         try:
-            d = await self._chat_json(self._json_model(), sysp, user, max_tokens=1200)
+            model = self._json_model()
+            d = await self._chat_json(model, sysp, user, max_tokens=1200)
             struct = self._coerce_analysis(d, defaults, qctx)
-            return {"ok": True, "struct": struct, "text": _render_analysis(inst, struct, qctx)}
+            text = _render_analysis(inst, struct, qctx)
+            if not d:        # 模型 200 但空/不可解析 -> 别把【量化默认值】当成 AI 研判
+                text = ("⚠ AI 未返回有效内容 (模型名可能不对/被限流/只输出了思维链)。\n"
+                        f"   当前结构化模型={model}; 请到『账户与密钥』点『验证AI』排查; "
+                        "DeepSeek 模型名应为 deepseek-chat / deepseek-reasoner。\n"
+                        "   下面是【量化默认值, 非AI研判】, 可照常导入手动交易:\n\n") + text
+                return {"ok": False, "struct": struct, "text": text}
+            return {"ok": True, "struct": struct, "text": text}
         except Exception as e:
             return {"ok": False, "struct": defaults,
                     "text": f"AI 分析失败: {e!r}\n已保留量化默认值, 仍可『导入手动交易』。"}

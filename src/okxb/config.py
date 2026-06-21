@@ -79,8 +79,10 @@ class Secrets:
         self.ai_provider = os.getenv("AI_PROVIDER", "rule").strip().lower()
         self.ai_api_key = os.getenv("AI_API_KEY", "") or os.getenv("ANTHROPIC_API_KEY", "")
         self.ai_base_url = os.getenv("AI_BASE_URL", "https://api.deepseek.com")
-        self.ai_model_simple = os.getenv("AI_MODEL_SIMPLE", "deepseek-v4-flash")
-        self.ai_model_hard = os.getenv("AI_MODEL_HARD", "deepseek-v4-pro")
+        # DeepSeek 官方模型名: deepseek-chat(便宜快) / deepseek-reasoner(强, 推理)。
+        # 注: 旧默认 deepseek-v4-flash/-pro 不是有效模型名, 会导致调用空返回 -> 选品/分析为空。
+        self.ai_model_simple = os.getenv("AI_MODEL_SIMPLE", "deepseek-chat")
+        self.ai_model_hard = os.getenv("AI_MODEL_HARD", "deepseek-reasoner")
         # 选型策略: auto(按难度: 自由文本新闻+高危8-K用pro, 其余用flash) / flash(总用便宜) / pro(总用强)
         self.ai_tier_policy = os.getenv("AI_TIER_POLICY", "auto").strip().lower()
         # 向后兼容: 仅配了 ANTHROPIC_API_KEY 而未显式选 provider 时, 视为 claude

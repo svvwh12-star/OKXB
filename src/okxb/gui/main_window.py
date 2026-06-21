@@ -742,10 +742,10 @@ class OKXBApp(ctk.CTk):
         self._opt_entry(scroll, "AI API Key", "AI_API_KEY", env)
         self._opt_entry(scroll, "Base URL", "AI_BASE_URL", env, mask=False,
                         default="https://api.deepseek.com")
-        self._opt_entry(scroll, "简单任务模型 (便宜快)", "AI_MODEL_SIMPLE", env, mask=False,
-                        default="deepseek-v4-flash")
-        self._opt_entry(scroll, "复杂任务模型 (更强)", "AI_MODEL_HARD", env, mask=False,
-                        default="deepseek-v4-pro")
+        self._opt_entry(scroll, "简单任务模型 (便宜快; DeepSeek=deepseek-chat)", "AI_MODEL_SIMPLE",
+                        env, mask=False, default="deepseek-chat")
+        self._opt_entry(scroll, "复杂任务模型 (更强; DeepSeek=deepseek-reasoner)", "AI_MODEL_HARD",
+                        env, mask=False, default="deepseek-reasoner")
         trow = ctk.CTkFrame(scroll, fg_color="transparent")
         trow.pack(fill="x", pady=2)
         ctk.CTkLabel(trow, text="选型策略", font=FONT, width=110, anchor="w").pack(side="left")
