@@ -11,6 +11,7 @@ is testable in the main suite (the runner scripts themselves do heavy imports):
 """
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import time
@@ -93,3 +94,83 @@ def write_dead(frozen_dir: Path, code: str, reason: str, stats: Optional[dict] =
 def clear_dead(frozen_dir: Path, code: str) -> None:
     """Remove the DEAD marker (only on a fresh re-freeze = a brand-new registration)."""
     dead_path(frozen_dir, code).unlink(missing_ok=True)
+
+
+# ----------------- RV-1: append-only hash-chained status log -----------------
+# Each appended row carries prev_sha + row_sha = sha256(prev_sha | canonical(row)). Any
+# retroactive edit/insert/delete of an earlier row breaks the chain -> tamper-evident forward log.
+
+_HASH_COLS = ("prev_sha", "row_sha")
+_GENESIS = "GENESIS"
+
+
+def chain_hash(prev_sha: str, row: dict) -> str:
+    """Deterministic hash of a row's data (hash columns excluded; None and '' treated equal,
+    all values stringified so write-time python types and read-time CSV strings agree)."""
+    payload = {k: ("" if row[k] is None else str(row[k]))
+               for k in row if k not in _HASH_COLS}
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256((str(prev_sha) + "|" + blob).encode("utf-8")).hexdigest()
+
+
+def _last_row_sha(path: Path) -> str:
+    last = None
+    with open(path, newline="", encoding="utf-8") as f:
+        for last in csv.DictReader(f):
+            pass
+    return (last or {}).get("row_sha") or _GENESIS
+
+
+def append_rows_hashchain(path: Path, rows: list) -> None:
+    """Append rows to a CSV as a tamper-evident hash chain. Archives the old file if the column
+    set changed (one-time schema migration), then continues the chain from the last row_sha."""
+    path = Path(path)
+    rows = [dict(r) for r in rows]
+    if not rows:
+        return
+    data_fields: list[str] = []
+    for r in rows:
+        for k in r:
+            if k not in data_fields and k not in _HASH_COLS:
+                data_fields.append(k)
+    fieldnames = data_fields + list(_HASH_COLS)
+    if path.exists():
+        with open(path, newline="", encoding="utf-8") as f:
+            existing = next(csv.reader(f), [])
+        if existing and set(existing) != set(fieldnames):
+            path.replace(path.with_name(f"{path.stem}_archived_{int(time.time())}{path.suffix}"))
+    prev = _last_row_sha(path) if path.exists() else _GENESIS
+    write_header = not path.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            w.writeheader()
+        for r in rows:
+            full = {k: r.get(k) for k in data_fields}
+            row_sha = chain_hash(prev, full)
+            full["prev_sha"], full["row_sha"] = prev, row_sha
+            w.writerow(full)
+            prev = row_sha
+
+
+def verify_hashchain(path: Path) -> Optional[str]:
+    """None if the chain is intact; else a description of the first broken/tampered row."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        cols = reader.fieldnames or []
+        if "row_sha" not in cols or "prev_sha" not in cols:
+            return "no hash columns (legacy file, not chained)"
+        data_fields = [c for c in cols if c not in _HASH_COLS]
+        prev = _GENESIS
+        for i, r in enumerate(reader):
+            if (r.get("prev_sha") or _GENESIS) != prev:
+                return f"row {i}: prev_sha broken (insert/delete/reorder)"
+            full = {k: r.get(k, "") for k in data_fields}
+            if r.get("row_sha") != chain_hash(prev, full):
+                return f"row {i}: content tampered (row_sha mismatch)"
+            prev = r.get("row_sha")
+    return None

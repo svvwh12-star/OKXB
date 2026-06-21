@@ -96,6 +96,11 @@ class Grid:
     tp_rr: list = field(default_factory=lambda: [1.2, 1.6, 2.2])     # 止盈盈亏比
     modes: list = field(default_factory=lambda: ["barrier", "barrier+rev", "barrier+rev+trail"])
 
+    def size(self) -> int:
+        """完整网格尝试数 = 各维长度之积 (DSR/PBO 多重检验的诚实试验计数, 含未产生交易的组合)。"""
+        return (len(self.S) * len(self.C) * len(self.N) * len(self.H)
+                * len(self.tp_rr) * len(self.modes))
+
 
 MODE_LABEL = {
     "barrier": "三重障碍(止盈/止损/超时)",
@@ -417,7 +422,8 @@ def run_calibration(by_inst: dict, grid: Grid, min_trades: int, cooldown_s: floa
     train_results = run_grid(train, grid, cooldown_s, cost_mult, maker_fill, rev_gap,
                              sl_cost_mult, min_edge_cost, sm, progress)
     picks = pick_best(train_results, min_trades)
-    n_trials = len(train_results)
+    # RV-10: DSR/PBO 的多重检验试验数 = 完整网格尝试数 (而非仅产生交易的有效配置数, 否则低估过拟合)
+    n_trials = max(grid.size(), len(train_results))
     kw = dict(cooldown_ms=cooldown_s * 1000.0, cost_mult=cost_mult, maker_fill=maker_fill,
               rev_gap=rev_gap, sl_cost_mult=sl_cost_mult, min_edge_cost=min_edge_cost, sm=sm)
     oos = {}
@@ -428,10 +434,14 @@ def run_calibration(by_inst: dict, grid: Grid, min_trades: int, cooldown_s: floa
                 o = _sim_combo(test, r.S, r.C, r.N, r.H, r.tp_rr, r.mode, **kw)
                 o.dsr = lb.deflated_sharpe(o.nets, n_trials)   # 样本外紧缩夏普
                 oos[key] = o
-    # 过拟合概率 PBO: 仅在收益前K个配置上 (控制 C(8,4)=70 splits 的成本)
+    # 过拟合概率 PBO: 在【代表性的全部配置】上算, 不只收益前K个 —— 只在赢家里比会系统性低估 PBO。
+    # 配置过多时按网格顺序等距抽样(非按收益), 保持代表性并控制 C(8,4)=70 splits 的成本。
     pbo = None
-    topk = picks.get("top", [])[:12]
-    config_nets = {f"c{i}": r.nets for i, r in enumerate(topk) if r.nets}
+    cfgs_all = [r for r in train_results if r.nets]
+    if len(cfgs_all) > 120:
+        step = len(cfgs_all) // 120 + 1
+        cfgs_all = cfgs_all[::step]
+    config_nets = {f"c{i}": r.nets for i, r in enumerate(cfgs_all)}
     if len(config_nets) >= 2:
         res = lb.pbo_cscv(config_nets, s_blocks=8)
         pbo = res[0] if res else None

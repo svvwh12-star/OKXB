@@ -47,3 +47,24 @@ def test_dead_marker_roundtrip(tmp_path):
     assert d and d["reason"].startswith("forward KILL") and d["stats"]["n_ts"] == 41
     fi.clear_dead(frozen, "C")                              # only a fresh re-freeze clears it
     assert fi.read_dead(frozen, "C") is None
+
+
+# ----------------- RV-1: append-only hash-chained status log -----------------
+
+def test_hashchain_detects_history_tamper(tmp_path):
+    csv_path = tmp_path / "forward_status.csv"
+    fi.append_rows_hashchain(csv_path, [{"asof": "t0", "code": "A", "verdict": "PENDING", "n_ts": 10}])
+    fi.append_rows_hashchain(csv_path, [{"asof": "t1", "code": "A", "verdict": "KILL", "n_ts": 41}])
+    assert fi.verify_hashchain(csv_path) is None            # intact chain across two appends
+
+    # retroactively rewrite an earlier verdict (the cherry-pick attack) -> chain must break
+    txt = csv_path.read_text(encoding="utf-8").replace("PENDING", "PASS")
+    csv_path.write_text(txt, encoding="utf-8")
+    assert fi.verify_hashchain(csv_path) is not None
+
+
+def test_hashchain_handles_heterogeneous_rows(tmp_path):
+    csv_path = tmp_path / "s.csv"
+    fi.append_rows_hashchain(csv_path, [{"code": "A", "verdict": "PENDING", "net10_bps": 1.5}])
+    fi.append_rows_hashchain(csv_path, [{"code": "B", "verdict": "DEAD"}])   # missing net10_bps
+    assert fi.verify_hashchain(csv_path) is None            # None-filled columns still verify

@@ -102,17 +102,39 @@ def _net(port: np.ndarray, cost_bps: float):
     return (st["net_bps"], st["nw_t"]) if st else (np.nan, np.nan)
 
 
+def _train_net_ref(data: pd.DataFrame, score: np.ndarray, tau: float, H: int, bar_ms: int) -> dict:
+    """RV-11/PASS-5: 训练段在冻结 tau 下的净edge参考 (train_ref), 供前向"无衰减"判据用基准。"""
+    mask = np.abs(score) >= tau
+    if int(mask.sum()) < 8:
+        return {}
+    sub = data[mask].copy()
+    sub["score"] = score[mask]
+    h = max(1, round(H / (bar_ms / 60_000)))
+    reb = set(cr._rebalance_ts(np.sort(sub["ts"].unique()), bar_ms, h).tolist())
+    tr = sub[sub["ts"].isin(reb)]
+    if len(tr) < 8:
+        return {}
+    signed = np.sign(tr["score"].values) * tr["fwd"].values
+    port = pd.Series(signed, index=tr["ts"].values).groupby(level=0).mean().values
+    n10, _ = _net(port, TAKER_BPS)
+    return {"train_net10_bps": round(float(n10), 1) if np.isfinite(n10) else None,
+            "train_n_ts": int(len(port))}
+
+
 def forward_verdict(net15, t15, net10, n_ts, fwd_ic_sign, train_ic_sign, weeks,
-                    t_pass: Optional[float] = None) -> str:
-    """与加密 forward 协议同逻辑(纯函数)。t_pass 默认用族级 Bonferroni 阈值 T_PASS。"""
+                    t_pass: Optional[float] = None, train_net10: Optional[float] = None) -> str:
+    """与加密 forward 协议同逻辑(纯函数)。t_pass 默认用族级 Bonferroni 阈值 T_PASS;
+    train_net10 给定时启用 PASS-5 无衰减判据 (前向 net10 须 >= 训练 net10 的一半)。"""
     tp = T_PASS if t_pass is None else t_pass
     if n_ts >= 8:
         if (net10 is not None and net10 <= 0) or (fwd_ic_sign != 0 and fwd_ic_sign != train_ic_sign):
             return "KILL"
     if weeks >= 8 and n_ts < N_KILL:
         return "KILL"
+    decay_ok = (train_net10 is None or train_net10 <= 0
+                or (net10 is not None and net10 >= 0.5 * train_net10))
     if (net15 is not None and net15 > 0 and (t15 or 0) > tp and n_ts >= N_MIN
-            and fwd_ic_sign == train_ic_sign):
+            and fwd_ic_sign == train_ic_sign and decay_ok):
         return "PASS"
     return "PENDING"
 
@@ -152,6 +174,7 @@ def freeze() -> None:
         "freeze_cutoff_ts": cutoff, "frozen_at_ms": stamp, "official_forward_start_ts": stamp,
         # RV-4: 永久记录"板块是同期成本闸门事后挑选"这一出处, 任何 PASS 都须带此 caveat 解读
         "sector_selection": "in_sample_costgate", "sectors_screened": SECTORS_SCREENED,
+        **_train_net_ref(data, train_score, tau, H, bar_ms),    # RV-11: 训练净edge基准
     }, indent=2), encoding="utf-8")
     fi.write_manifest(d)                                # RV-1: 工件内容哈希清单
     fi.clear_dead(FROZEN, CANDIDATE["code"])            # 重新冻结=全新登记, 清旧死标
@@ -231,7 +254,8 @@ def evaluate() -> None:
             net15, t15 = _net(port, TAKER_BPS * STRESS_MULT)
             fic = cr._spearman(tr["score"].values, tr["fwd"].values) if len(tr) > 5 else 0.0
             fic_sign = int(np.sign(fic or 0.0))
-            verdict = forward_verdict(net15, t15, net10, len(port), fic_sign, train_ic_sign, weeks)
+            verdict = forward_verdict(net15, t15, net10, len(port), fic_sign, train_ic_sign, weeks,
+                                      train_net10=meta.get("train_net10_bps"))
             if verdict == "KILL":               # RV-2: 落盘死标, 此后不复活
                 fi.write_dead(FROZEN, CANDIDATE["code"],
                               f"forward KILL: net10={net10:.1f} fwd_ic_sign={fic_sign} "
@@ -243,14 +267,10 @@ def evaluate() -> None:
                         "fwd_ic": round(float(fic), 4), "fwd_ic_sign": fic_sign,
                         "train_ic_sign": train_ic_sign, "verdict": verdict})
     hist = FWD / "stock_forward_status.csv"
-    df = pd.DataFrame([row])
-    if hist.exists():
-        try:
-            if pd.read_csv(hist, nrows=0).columns.tolist() != df.columns.tolist():
-                hist.replace(FWD / f"stock_forward_status_archived_{int(time.time())}.csv")
-        except Exception:  # noqa: BLE001
-            hist.replace(FWD / f"stock_forward_status_archived_{int(time.time())}.csv")
-    df.to_csv(hist, mode="a", header=not hist.exists(), index=False)
+    fi.append_rows_hashchain(hist, [row])      # RV-1: 防篡改哈希链 (改历史行即断链; schema 变更自动归档)
+    chain = fi.verify_hashchain(hist)
+    if chain is not None:
+        log(f"⚠ stock_forward_status 哈希链异常: {chain}")
     log(f"[{CANDIDATE['code']}] H={H} weeks={weeks:.1f} 累积观测={len(allobs)} n_ts={row.get('n_ts')} "
         f"net10={row.get('net10_bps', '-')}(t{row.get('t10', '-')}) "
         f"net15={row.get('net15_bps', '-')}(t{row.get('t15', '-')}) "
@@ -433,6 +453,9 @@ def selftest() -> None:
     assert forward_verdict(5.0, 2.5, 6.0, 20, 1, 1, 9.0, t_pass=2.13) == "KILL"        # 8wk 且 n<30
     # RV-3/RV-4: 事后挑板块 -> 阈值比旧 2.13 更严 (含板块搜索多重检验)
     assert T_PASS > 2.13 and T_PASS >= bonferroni_t(N_PARALLEL_CANDIDATES + SECTORS_SCREENED - 1) - 1e-9
+    # RV-11/PASS-5: 相对训练段无衰减才 PASS
+    assert forward_verdict(5.0, 2.5, 6.0, 60, 1, 1, 2.0, t_pass=2.13, train_net10=8.0) == "PASS"     # 6>=4
+    assert forward_verdict(5.0, 2.5, 3.0, 60, 1, 1, 2.0, t_pass=2.13, train_net10=8.0) == "PENDING"   # 3<4 衰减
     log("selftest OK")
 
 

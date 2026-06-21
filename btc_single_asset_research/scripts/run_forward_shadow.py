@@ -227,12 +227,14 @@ def freeze() -> None:
             pickle.dump({"model": model, "kind": kind, "scaler": scaler}, fh)
         (d / "feature_list.json").write_text(json.dumps(sel), encoding="utf-8")
         (d / "median.json").write_text(json.dumps(med.to_dict()), encoding="utf-8")
+        train_ref = _train_net_ref(data, train_score, tau, H, bar_ms)   # RV-11: 训练净edge基准
         (d / "meta.json").write_text(json.dumps({
             "code": code, "H": H, "model": model_name, "top_frac": top_frac, "bar_ms": bar_ms,
             "tau": tau, "ic_sign": ic_sign, "insample_ic_sign": insample_ic_sign, "n_sel": len(sel),
             "freeze_cutoff_ts": int(data["ts"].max()), "frozen_at_ms": stamp,
             "official_forward_start_ts": stamp,
             "apply_funding_train": bool(H >= 240),
+            **train_ref,
         }, indent=2), encoding="utf-8")
         _write_manifest(d)                              # RV-1: 工件内容哈希清单 (证明此后未改)
         _dead_path(code).unlink(missing_ok=True)        # 重新冻结=全新登记, 清除旧的 KILL 死标
@@ -245,18 +247,41 @@ def _net(port: np.ndarray, cost_bps: float):
     return (st["net_bps"], st["nw_t"]) if st else (np.nan, np.nan)
 
 
+def _train_net_ref(data: pd.DataFrame, score: np.ndarray, tau: float, H: int, bar_ms: int) -> dict:
+    """RV-11/PASS-5: 训练段在冻结 tau 下的净edge参考 (train_ref), 供前向"无衰减"判据用基准。"""
+    mask = np.abs(score) >= tau
+    if int(mask.sum()) < 8:
+        return {}
+    sub = data[mask].copy()
+    sub["score"] = score[mask]
+    h = max(1, round(H / (bar_ms / 60_000)))
+    reb = set(cr._rebalance_ts(np.sort(sub["ts"].unique()), bar_ms, h).tolist())
+    tr = sub[sub["ts"].isin(reb)]
+    if len(tr) < 8:
+        return {}
+    signed = np.sign(tr["score"].values) * tr["fwd"].values
+    port = pd.Series(signed, index=tr["ts"].values).groupby(level=0).mean().values
+    n10, _ = _net(port, TAKER_BPS)
+    return {"train_net10_bps": round(float(n10), 1) if np.isfinite(n10) else None,
+            "train_n_ts": int(len(port))}
+
+
 def forward_verdict(net15: float, t15: float, net10: float, n_ts: int,
                     fwd_ic_sign: int, train_ic_sign: int, weeks: float,
-                    t_pass: Optional[float] = None) -> str:
-    """Pure PASS/KILL logic per protocol section 4/5. t_pass 默认用族级 Bonferroni 阈值 T_PASS。"""
+                    t_pass: Optional[float] = None, train_net10: Optional[float] = None) -> str:
+    """Pure PASS/KILL logic per protocol section 4/5. t_pass 默认用族级 Bonferroni 阈值 T_PASS;
+    train_net10 给定时启用 PASS-5 无衰减判据 (前向 net10 须 >= 训练 net10 的一半)。"""
     tp = T_PASS if t_pass is None else t_pass
     if n_ts >= 8:
         if (net10 is not None and net10 <= 0) or (fwd_ic_sign != 0 and fwd_ic_sign != train_ic_sign):
             return "KILL"
     if weeks >= 6 and n_ts < N_KILL:
         return "KILL"
+    # PASS-5: 相对训练段无明显衰减 (无 train_ref 或训练非正 -> 不以此为否决项)
+    decay_ok = (train_net10 is None or train_net10 <= 0
+                or (net10 is not None and net10 >= 0.5 * train_net10))
     if (net15 is not None and net15 > 0 and (t15 or 0) > tp and n_ts >= N_MIN
-            and fwd_ic_sign == train_ic_sign):
+            and fwd_ic_sign == train_ic_sign and decay_ok):
         return "PASS"
     return "PENDING"
 
@@ -345,7 +370,8 @@ def evaluate() -> None:
                 net15, t15 = _net(port, TAKER_BPS * STRESS_MULT)
                 fic = cr._spearman(tr["score"].values, tr["fwd"].values) if len(tr) > 5 else 0.0
                 fic_sign = int(np.sign(fic or 0.0))
-                verdict = forward_verdict(net15, t15, net10, len(port), fic_sign, train_ic_sign, weeks)
+                verdict = forward_verdict(net15, t15, net10, len(port), fic_sign, train_ic_sign, weeks,
+                                          train_net10=meta.get("train_net10_bps"))
                 if verdict == "KILL":               # RV-2: 落盘死标, 此后不再复活
                     _write_dead(code, f"forward KILL: net10={net10:.1f} fwd_ic_sign={fic_sign} "
                                 f"vs train={train_ic_sign} n_ts={len(port)} weeks={weeks:.1f}",
@@ -360,23 +386,12 @@ def evaluate() -> None:
             f"net10={row.get('net10_bps','-')}(t{row.get('t10','-')}) "
             f"net15={row.get('net15_bps','-')}(t{row.get('t15','-')}) "
             f"fwd_ic={row.get('fwd_ic','-')} -> {row['verdict']}")
-    df = pd.DataFrame(rows)
     stamp = enh.ts_utc(now_ms)
-    df.insert(0, "asof_utc", stamp)
     hist = FWD / "forward_status.csv"
-    if hist.exists():
-        try:
-            old_cols = pd.read_csv(hist, nrows=0).columns.tolist()
-            if old_cols != df.columns.tolist():
-                archive = FWD / f"forward_status_archived_{int(time.time())}.csv"
-                hist.replace(archive)
-                log(f"archived incompatible status file to {archive}")
-        except Exception as exc:  # noqa: BLE001
-            archive = FWD / f"forward_status_archived_{int(time.time())}.csv"
-            hist.replace(archive)
-            log(f"archived unreadable status file to {archive}: {type(exc).__name__}: {exc}")
-    df.to_csv(hist, mode="a", header=not hist.exists(), index=False)
-    log(f"\nappended {len(rows)} rows to {hist}")
+    # RV-1: 追加为防篡改哈希链 (每行 prev_sha/row_sha; 改任何历史行都会断链; schema 变更自动归档)
+    fi.append_rows_hashchain(hist, [{"asof_utc": stamp, **r} for r in rows])
+    chain = fi.verify_hashchain(hist)
+    log(f"\nappended {len(rows)} rows to {hist} (hash-chain: {'OK' if chain is None else '⚠ ' + chain})")
     log("decision: 0 PASS at window end -> clean closure; any PASS -> second independent forward + tiny live fill test.")
 
 
@@ -619,6 +634,24 @@ def selftest() -> None:
     assert forward_verdict(5.0, 2.5, -1.0, 60, 1, 1, 2.0, t_pass=2.13) == "KILL"     # net10<=0
     assert forward_verdict(5.0, 2.5, 6.0, 60, -1, 1, 2.0, t_pass=2.13) == "KILL"     # IC flipped
     assert forward_verdict(5.0, 2.5, 6.0, 20, 1, 1, 6.5, t_pass=2.13) == "KILL"      # 6wk and n<30
+    # RV-11/PASS-5: 相对训练段无衰减才算 PASS; 前向净 < 训练净一半 -> 衰减 -> PENDING
+    assert forward_verdict(5.0, 2.5, 6.0, 60, 1, 1, 2.0, t_pass=2.13, train_net10=8.0) == "PASS"    # 6>=4
+    assert forward_verdict(5.0, 2.5, 3.0, 60, 1, 1, 2.0, t_pass=2.13, train_net10=8.0) == "PENDING"  # 3<4 衰减
+    assert forward_verdict(5.0, 2.5, 6.0, 60, 1, 1, 2.0, t_pass=2.13, train_net10=None) == "PASS"   # 无基准不否决
+    # RV-1: forward_status 哈希链可检出历史行篡改
+    import shutil as _sh2
+    import tempfile as _tf2
+    _td2 = Path(_tf2.mkdtemp())
+    try:
+        _csv = _td2 / "s.csv"
+        fi.append_rows_hashchain(_csv, [{"code": "A", "verdict": "PENDING"}])
+        fi.append_rows_hashchain(_csv, [{"code": "A", "verdict": "KILL"}])
+        assert fi.verify_hashchain(_csv) is None
+        _txt = _csv.read_text(encoding="utf-8").replace("PENDING", "PASS")   # 偷改历史裁决
+        _csv.write_text(_txt, encoding="utf-8")
+        assert fi.verify_hashchain(_csv) is not None                          # 断链被发现
+    finally:
+        _sh2.rmtree(_td2, ignore_errors=True)
     # RV-3: Bonferroni 阈值随候选数单调收紧; 默认 T_PASS 已按真实族 (>=7) 校正, 比旧的 2.13 更严
     assert bonferroni_t(3) < bonferroni_t(7) < bonferroni_t(20)
     assert abs(bonferroni_t(3) - 2.128) < 0.03
