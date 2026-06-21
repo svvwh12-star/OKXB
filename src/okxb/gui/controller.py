@@ -478,6 +478,47 @@ def imr_status_sync() -> str:
         return f"IMR 状态读取失败: {e!r}"
 
 
+# ----------------- AI 前向验证 (进程内, 供 GUI 按钮; 测 AI 方向有无前向 edge) -----------------
+def aifwd_collect_sync() -> str:
+    from ..research import ai_forward_runner as r
+    return _run(r.collect())
+
+
+def aifwd_evaluate_sync() -> str:
+    try:
+        from ..research import ai_forward_runner as r
+        return r.evaluate()
+    except Exception as e:
+        return f"AI 前向验证评估失败: {e!r}"
+
+
+def aifwd_status_sync() -> str:
+    try:
+        from ..research import ai_forward_runner as r
+        return r.status()
+    except Exception as e:
+        return f"AI 前向验证状态读取失败: {e!r}"
+
+
+# ----------------- 研究数据保存目录 (IMR + AI前向 共用) -----------------
+def get_research_dir() -> str:
+    try:
+        from ..research.datadir import research_base
+        return str(research_base())
+    except Exception as e:
+        return f"(读取失败: {e!r})"
+
+
+def set_research_dir(path: str) -> str:
+    """保存研究数据目录到 .env (RESEARCH_DATA_DIR); 空=恢复默认。下次采集生效。"""
+    write_env({"RESEARCH_DATA_DIR": (path or "").strip()})
+    try:
+        from ..research.datadir import research_base
+        return f"已保存研究数据目录:\n{research_base()}" + ("" if (path or "").strip() else "  (默认)")
+    except Exception as e:
+        return f"已保存, 但解析失败: {e!r}"
+
+
 async def _get_spec(rest, inst_id):
     from ..exchange.okx_rest import OkxError
     try:

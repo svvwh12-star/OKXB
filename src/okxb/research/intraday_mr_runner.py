@@ -12,17 +12,17 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from .. import paths
 from ..config import Config, Secrets
 from ..exchange.okx_rest import OkxRestClient
 from . import intraday_mr as imr
+from .datadir import research_base
 from .forward_integrity import (append_rows_hashchain, read_dead, verify_hashchain,
                                 write_dead, write_manifest)
 from .labeling import pbo_cscv
 
 
 def _base() -> Path:
-    b = paths.APP_DIR / "data" / "intraday_mr"
+    b = research_base() / "intraday_mr"
     b.mkdir(parents=True, exist_ok=True)
     return b
 

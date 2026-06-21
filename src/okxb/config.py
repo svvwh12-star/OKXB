@@ -74,6 +74,8 @@ class Secrets:
         self.econ_calendar_api_key = os.getenv("TRADING_ECONOMICS_API_KEY", "")
         # CoinGecko demo key: 行情/大盘数据(非新闻) — 全球市值/BTC占比/热搜趋势, 喂给 AI 选品
         self.coingecko_api_key = os.getenv("COINGECKO_API_KEY", "")
+        # 研究数据保存目录 (IMR / AI 前向验证 共用; 留空=APP_DIR/data)
+        self.research_data_dir = os.getenv("RESEARCH_DATA_DIR", "")
 
         # AI 事件分类: 提供商无关 (DeepSeek / OpenAI兼容 / Claude); 简单任务用便宜模型, 复杂任务用强模型
         self.ai_provider = os.getenv("AI_PROVIDER", "rule").strip().lower()

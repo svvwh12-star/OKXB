@@ -588,9 +588,8 @@ class OKXBApp(ctk.CTk):
     # ----------------- AI 选品 -----------------
 
     def _one_click_accrue(self) -> None:
-        """一键开始【累计研究数据】(exe 内可用): 启动 demo 录制引擎 + 触发 IMR 前向采集。
-        AI 研判按需点(耗 token, 不放进自动循环)。"""
-        from .controller import imr_collect_sync
+        """一键开始【累计研究数据】(exe 内可用): demo 录制引擎 + IMR 前向采集 + AI 前向验证记录。"""
+        from .controller import aifwd_collect_sync, imr_collect_sync
         parts = []
         mode = read_env().get("OKXB_MODE", "demo")
         if mode != "demo":
@@ -605,16 +604,18 @@ class OKXBApp(ctk.CTk):
             self.stop_btn.configure(state="normal")
             self.mode_seg.configure(state="disabled")
             parts.append("• 已启动【虚拟盘·只演练】引擎 → 累积 calib 录制(供策略校准/信号检验)。")
-        parts.append("• IMR 15/30min 前向采集: 后台触发中(进度见『多周期研究』页 IMR 区)。")
-        parts.append("• AI 研判: 按需点『AI分析』/『AI选品』即可(会耗 token, 故不放进自动循环)。")
+        parts.append("• IMR 15/30min 前向采集: 后台触发(进度见『多周期研究』页 IMR 区)。")
+        parts.append("• AI 前向验证: 后台记录一次 AI 判断(每标的每60min至多1次, 少量 token; 需已配 AI)。")
         self._append_log("[一键累计] " + " / ".join(parts))
         messagebox.showinfo("一键累计数据", "\n".join(parts) +
-                            "\n\n数据随时间累积; 已注册的 4 小时计划任务也会无人值守采集 BTC/ETH/股票/IMR。")
+                            "\n\n数据随时间累积; 已注册的 4 小时计划任务也会无人值守采集 BTC/ETH/股票/IMR。\n"
+                            "(单标的 AI 研判仍可按需点『AI分析』。)")
 
         def work():
-            r = imr_collect_sync()
-            tail = (r.splitlines() or ["(无输出)"])[-1]
-            self.after(0, lambda: self._append_log("[一键累计·IMR] " + tail))
+            imr_tail = (imr_collect_sync().splitlines() or ["(无)"])[-1]
+            self.after(0, lambda: self._append_log("[一键累计·IMR] " + imr_tail))
+            ai_tail = (aifwd_collect_sync().splitlines() or ["(无)"])[-1]
+            self.after(0, lambda: self._append_log("[一键累计·AI前向] " + ai_tail))
         threading.Thread(target=work, daemon=True).start()
 
     def _ai_pick_run(self) -> None:
@@ -949,8 +950,82 @@ class OKXBApp(ctk.CTk):
                             "首次会自动冻结 official_forward_start。只采集不实盘。\n")
         self.imr_box.configure(state="disabled")
         self._imr_busy = False
+
+        # ---- AI 前向验证 (测『AI 方向判断』60min 后有无净 edge; 进程内; 只记录不实盘) ----
+        aff = ctk.CTkFrame(t, fg_color="#2a1f2a")
+        aff.pack(fill="x", padx=8, pady=(2, 8))
+        ctk.CTkLabel(aff, text="AI 前向验证 (测『AI 方向判断』60min 后有无净 edge · 只记录不实盘)",
+                     font=FONT_B, anchor="w").pack(fill="x", padx=8, pady=(6, 0))
+        ctk.CTkLabel(aff, text="记下 AI 对 BTC/ETH/SOL 的多空判断+当时价, 60min 后实价结算; 攒≥100 判前向 IC。"
+                     "省 token: 每标的每 60min 至多调 1 次 AI; 未配 AI 则不调。诚实预期: AI 方向多半无 edge -> PENDING/KILL。",
+                     font=FONT_S, text_color=GREY, anchor="w", wraplength=900, justify="left").pack(fill="x", padx=8)
+        abr = ctk.CTkFrame(aff, fg_color="transparent"); abr.pack(fill="x", padx=8, pady=4)
+        ctk.CTkButton(abr, text="⬇ 采集一次", font=FONT_B, width=110, fg_color="#a05cff",
+                      command=lambda: self._aifwd_run("collect")).pack(side="left", padx=4)
+        ctk.CTkButton(abr, text="⚖ 评估判决", font=FONT_B, width=110, fg_color="#3a7ebf",
+                      command=lambda: self._aifwd_run("evaluate")).pack(side="left", padx=4)
+        ctk.CTkButton(abr, text="📊 查看进度", font=FONT, width=100,
+                      command=lambda: self._aifwd_run("status")).pack(side="left", padx=4)
+        self.aifwd_box = ctk.CTkTextbox(aff, height=140, font=MONO)
+        self.aifwd_box.pack(fill="x", padx=8, pady=(2, 8))
+        self.aifwd_box.insert("end", "点『采集一次』记录一次 AI 判断(需先在『账户与密钥』配好 AI; 会耗少量 token)。\n")
+        self.aifwd_box.configure(state="disabled")
+        self._aifwd_busy = False
+
+        # ---- 研究数据保存目录 (IMR + AI前向 共用) ----
+        from .controller import get_research_dir
+        ddf = ctk.CTkFrame(t, fg_color="transparent"); ddf.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkLabel(ddf, text="研究数据保存目录:", font=FONT).pack(side="left", padx=(4, 4))
+        self.research_dir_lbl = ctk.CTkLabel(ddf, text=get_research_dir(), font=FONT_S, text_color=GREY)
+        self.research_dir_lbl.pack(side="left", padx=4)
+        ctk.CTkButton(ddf, text="📂 选择目录", font=FONT, width=96,
+                      command=self._pick_research_dir).pack(side="right", padx=4)
+        ctk.CTkButton(ddf, text="恢复默认", font=FONT, width=80, fg_color="#555",
+                      command=lambda: self._set_research_dir("")).pack(side="right", padx=4)
+
         self._multi_busy = False
         self._multi_refresh_now()
+
+    def _aifwd_set(self, text: str) -> None:
+        self.aifwd_box.configure(state="normal")
+        self.aifwd_box.delete("1.0", "end")
+        self.aifwd_box.insert("end", text + "\n")
+        self.aifwd_box.see("1.0")
+        self.aifwd_box.configure(state="disabled")
+
+    def _aifwd_run(self, kind: str) -> None:
+        if getattr(self, "_aifwd_busy", False):
+            return
+        from .controller import (aifwd_collect_sync, aifwd_evaluate_sync, aifwd_status_sync)
+        fn = {"collect": aifwd_collect_sync, "evaluate": aifwd_evaluate_sync,
+              "status": aifwd_status_sync}[kind]
+        if kind == "status":
+            self._aifwd_set(fn())
+            return
+        names = {"collect": "采集(调AI)", "evaluate": "评估判决"}
+        self._aifwd_set(f"... {names[kind]}中 (会调用 AI + 取价, 约数十秒) ...")
+        self._aifwd_busy = True
+
+        def work():
+            r = fn()
+
+            def done():
+                self._aifwd_busy = False
+                self._aifwd_set(r)
+            self.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _pick_research_dir(self) -> None:
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="选择研究数据保存目录")
+        if d:
+            self._set_research_dir(d)
+
+    def _set_research_dir(self, path: str) -> None:
+        from .controller import get_research_dir, set_research_dir
+        msg = set_research_dir(path)
+        self.research_dir_lbl.configure(text=get_research_dir())
+        messagebox.showinfo("研究数据目录", msg)
 
     def _imr_set(self, text: str) -> None:
         self.imr_box.configure(state="normal")
