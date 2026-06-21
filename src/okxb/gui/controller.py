@@ -237,6 +237,79 @@ async def _averify_finnhub() -> str:
         await fh.aclose()
 
 
+def verify_cryptonews_sync() -> str:
+    try:
+        return asyncio.run(_averify_cryptonews())
+    except Exception as e:
+        return f"加密新闻验证失败: {e!r}"
+
+
+async def _averify_cryptonews() -> str:
+    from ..events.cryptonews import CryptoNewsClient
+    s = Secrets()
+    cn = CryptoNewsClient(s.cryptopanic_api_key, s.crypto_news_rss_url)
+    if not cn.enabled:
+        return ("未配置加密新闻源。\n→ 填 CRYPTOPANIC_API_KEY (编辑聚合, 需 token) 或 "
+                "CRYPTO_NEWS_RSS_URL (默认 CoinDesk, 无需 key) 任一即可。\n"
+                "填后 AI选品/单标的分析会结合【带来源+时间戳】的加密新闻 (刻意不含裸社媒)。")
+    try:
+        items = await cn.headlines(currencies=["BTC", "ETH"], limit=5)
+        if not items:
+            return f"加密新闻源已配置({cn.label}), 但本次返回 0 条 (免费档限流/网络/RSS 暂空, 可稍后重试)。"
+        sample = "\n".join(f"  · {it.source}: {it.title[:60]}" for it in items[:3])
+        return f"加密新闻连通 ✓ ({cn.label})\n拉到 {len(items)} 条, 示例:\n{sample}\nAI 会结合这些(带来源/时间)研判。"
+    finally:
+        await cn.aclose()
+
+
+def verify_coingecko_sync() -> str:
+    try:
+        return asyncio.run(_averify_coingecko())
+    except Exception as e:
+        return f"CoinGecko 验证失败: {e!r}"
+
+
+async def _averify_coingecko() -> str:
+    from ..events.coingecko import CoinGeckoClient
+    cg = CoinGeckoClient(Secrets().coingecko_api_key)
+    if not cg.enabled:
+        return ("未配置 CoinGecko (COINGECKO_API_KEY 留空, 行情/大盘背景休眠)。\n"
+                "→ 这是【行情数据, 不是新闻】: 填免费 demo key 后, AI选品会看到全球加密市值/"
+                "BTC占比/热搜趋势作大盘背景。(新闻仍由 CoinDesk RSS 提供。)")
+    try:
+        items = await cg.market_context()
+        if not items:
+            return "CoinGecko 已配置, 但本次未取到数据 (key 无效/限流/网络, 可稍后重试)。"
+        sample = "\n".join(f"  · {it.title}" for it in items)
+        return f"CoinGecko 连通 ✓ ({cg.label})\n{sample}\nAI选品会把这些(带来源/时间)作大盘背景。"
+    finally:
+        await cg.aclose()
+
+
+def verify_econ_sync() -> str:
+    try:
+        return asyncio.run(_averify_econ())
+    except Exception as e:
+        return f"经济日历验证失败: {e!r}"
+
+
+async def _averify_econ() -> str:
+    from ..events.econ_calendar import EconCalendarClient
+    ec = EconCalendarClient(Secrets().econ_calendar_api_key)
+    if not ec.enabled:
+        return ("未配置经济日历 (TRADING_ECONOMICS_API_KEY 留空, 该功能休眠)。\n"
+                "→ 填 TradingEconomics key 后, AI 会看到 CPI/NFP/FOMC 排定时间, "
+                "手动页也会提示『距下次重大数据公布还有多久』(风险提示, 非预测)。")
+    try:
+        items = await ec.upcoming(hours_ahead=72)
+        if not items:
+            return "经济日历连通, 但未来 72h 无高重要度事件 (或免费档受限)。"
+        sample = "\n".join(f"  · {it.title} {it.extra}" for it in items[:4])
+        return f"经济日历连通 ✓\n未来 72h 高重要度事件 {len(items)} 个:\n{sample}"
+    finally:
+        await ec.aclose()
+
+
 def verify_edgar_sync() -> str:
     try:
         return asyncio.run(_averify_edgar())
@@ -437,6 +510,32 @@ def _manual_open_guard() -> Optional[str]:
     return None
 
 
+# ----------------- P4: 手动开仓的名义额度/杠杆闸门 (引擎在不在跑都生效) -----------------
+def _manual_notional_guard(notional: float) -> Optional[str]:
+    """单笔/单日名义额度闸门; 放行返回 None。异常时【失败关闭=拒绝】, 绝不放过超额开仓。"""
+    from ..risk import manual_gate
+    try:
+        return manual_gate.check_open(notional, Config.load())
+    except Exception as e:
+        return f"⛔ 风控闸门异常, 为安全已拒绝本次开仓 (请检查 config/账本): {e!r}"
+
+
+def _manual_record(notional: float) -> None:
+    from ..risk import manual_gate
+    try:
+        manual_gate.record_open(notional)
+    except Exception:
+        pass
+
+
+def _manual_leverage_guard(lever) -> Optional[str]:
+    from ..risk import manual_gate
+    try:
+        return manual_gate.check_leverage(lever, Config.load())
+    except Exception as e:
+        return f"⛔ 杠杆闸门异常, 为安全已拒绝设置杠杆: {e!r}"
+
+
 async def _manual_place(inst_id, side, ord_type, amount, unit, px, reduce_only) -> str:
     from ..exchange.okx_rest import OkxError
     if not reduce_only:                       # 开/加仓才拦; 平仓(reduce_only)始终放行
@@ -457,12 +556,23 @@ async def _manual_place(inst_id, side, ord_type, amount, unit, px, reduce_only) 
         sz, extra, err = await _sz_from(rest, spec, amount, unit, limit_px)
         if err:
             return err
+        notional = 0.0
+        if not reduce_only:                          # P4: 名义额度闸门 (仅开/加仓; 平仓不限)
+            ref_px = float(limit_px) if limit_px else float((ticker or {}).get("last", 0) or 0)
+            if ref_px <= 0:
+                ref_px = float((await rest.get_ticker(inst_id)).get("last", 0) or 0)
+            notional = float(sz) * float(spec.get("ctVal", 1) or 1) * ref_px
+            blk = _manual_notional_guard(notional)
+            if blk:
+                return blk
         pm = await _pos_mode(rest, mode)
         ps = _posside(pm, side, opening=not reduce_only)
         ronly = reduce_only and pm == "net_mode"     # 双向模式由 posSide 决定平/开, 不用 reduceOnly
         res = await rest.place_order(
             inst_id=inst_id, td_mode=mgn, side=side, ord_type=ord_type, sz=sz,
             px=limit_px, pos_side=ps, reduce_only=ronly)
+        if not reduce_only:
+            _manual_record(notional)                 # 成交后落账, 累计当日名义/笔数
         return f"[{mode}] 下单成功 ✓ ordId={res.get('ordId')} {inst_id} {side} {sz}张{extra} {ord_type} ({ps}){adj}"
     except OkxError as e:
         return f"[{mode}] 下单失败 ✗ {e}"
@@ -494,6 +604,10 @@ async def _manual_bracket(inst_id, side, ord_type, amount, unit, px, tp_px, sl_p
             return err
         # 入场参考价(实际): 限价/挂单用校正后价, 市价用现价
         ref = float(limit_px) if limit_px else (last or None)
+        notional = float(sz) * float(spec.get("ctVal", 1) or 1) * float(ref or last or 0)
+        blk = _manual_notional_guard(notional)       # P4: 套单=开仓, 走名义额度闸门
+        if blk:
+            return blk
         # 止盈/止损 按"相对原入场价的比例"重算到当前入场价 (修复导入价过期后 TP/SL 失效)
         orig = float(px) if px else None
         adj = ""
@@ -532,6 +646,7 @@ async def _manual_bracket(inst_id, side, ord_type, amount, unit, px, tp_px, sl_p
         res = await rest.place_order(
             inst_id=inst_id, td_mode=mgn, side=side, ord_type=ord_type, sz=sz,
             px=limit_px, pos_side=ps, reduce_only=False, attach_algo=[algo])
+        _manual_record(notional)                     # 成交后落账, 累计当日名义/笔数
         tp_s = f"止盈{tpx}" if tpx else "无止盈"
         sl_s = f"止损{spx}" if spx else "无止损"
         return (f"[{mode}] 套单已提交 ✓ ordId={res.get('ordId')} {inst_id} {side} {sz}张{extra} "
@@ -794,6 +909,8 @@ async def _quant_context(inst_id: str, row: dict) -> dict:
     lev_max = 50.0
     tick = None
     mid = row.get("mid")
+    mid_from_row = mid is not None
+    funding = None
     valid = False
     try:
         spec = await _get_spec(rest, inst_id)
@@ -804,10 +921,17 @@ async def _quant_context(inst_id: str, row: dict) -> dict:
         if mid is None and valid:
             t = await rest.get_ticker(inst_id)
             mid = float(t.get("last", 0) or 0) or None
+        if valid:                                   # 资金费率: 喂给 AI 的客观衍生品结构信号
+            try:
+                fr = await rest.get_funding_rate(inst_id)
+                funding = fr.get("fundingRate") if isinstance(fr, dict) else None
+            except OkxError:
+                funding = None
     except OkxError:
         pass
     finally:
         await rest.aclose()
+    data_age = "引擎实时(亚秒级)" if mid_from_row else ("实时(REST)" if mid else "未知")
 
     atr = row.get("atr")
     fees = cfg.section("fees")
@@ -860,6 +984,7 @@ async def _quant_context(inst_id: str, row: dict) -> dict:
         "entry_px": entry_px, "tp_px": tp_px, "sl_px": sl_px, "entry_off": round(entry_off, 5),
         "lev_suggest": lv, "lev_max": int(lev_max), "size_usdt": size_usdt,
         "target_risk": target_risk, "cost_pct": round(cost, 5), "valid": valid,
+        "funding_rate": funding, "data_age": data_age,
     }
 
 
@@ -871,6 +996,10 @@ async def _ai_analyze(inst_id, row) -> dict:
                 "text": f"⚠ 标的 {inst_id} 在OKX不存在或未上线, 无法分析/下单。\n"
                         "请检查标的名(加密如 BTC-USDT-SWAP, 美股如 AAPL-USDT-SWAP); "
                         "可在『控制台』列表里点正确的标的带入。"}
+    try:                       # P1: 给单标的分析喂【带出处与时间戳】的新闻/事件/经济日历 (失败不阻断)
+        qctx["evidence_text"] = await _evidence_for_symbol(inst_id)
+    except Exception:
+        qctx["evidence_text"] = ""
     res = await LLMClassifier.from_secrets(Secrets()).analyze_structured(inst_id, qctx)
     res["qctx"] = qctx
     return res
@@ -951,7 +1080,12 @@ async def _ai_pick(pool, rows) -> dict:
                     "picks": []}
         return {"text": f"[{pool_cn}] 暂无实时候选。请先在『控制台』▶启动引擎, 待行情填充后再选品。",
                 "picks": []}
-    brief = await _external_brief(pool, cands)        # Finnhub 真实新闻/财报 (有key才有)
+    bundle = await _evidence_for_pick(pool, cands)    # 多源带出处简报(新闻/财报/经济日历) + 每标的事件标签
+    brief = bundle["brief"]
+    for c in cands:                                   # P0: 把已抓到的事件标签喂给 AI (此前硬编码"无")
+        tag = bundle["by_ticker"].get(c["inst"].split("-")[0].upper())
+        if tag:
+            c["event"] = tag
     clf = LLMClassifier.from_secrets(Secrets())
     res = await clf.pick_products(pool_cn, cands, external_brief=brief)
     # 明确告知 AI 是否真的参与 (选品的"AI"是 DeepSeek; Finnhub/EDGAR 只是给它喂数据)
@@ -966,43 +1100,171 @@ async def _ai_pick(pool, rows) -> dict:
                      for c in cands[:8])
     res["text"] = (res.get("text", "") + "\n\n— 量化机会分前 8 (含真实24h涨跌, 客观排序) —\n" + head)
     if brief:
-        res["text"] += "\n\n— 外部资讯(Finnhub, 已喂给AI) —\n" + brief
+        res["text"] += "\n\n— 外部资讯(多源·每条带来源与时间, 已喂给AI) —\n" + brief
     else:
-        res["text"] += ("\n\n(未启用 Finnhub 外部资讯: 『账户与密钥』填 FINNHUB_API_KEY 后, "
-                        "选品会结合真实财经新闻/财报日历)")
+        res["text"] += ("\n\n(未启用外部资讯: 在『账户与密钥』填 FINNHUB_API_KEY / CRYPTOPANIC_API_KEY / "
+                        "CRYPTO_NEWS_RSS_URL / TRADING_ECONOMICS_API_KEY 任意项, 选品即结合带出处的真实资讯)")
     res["cands"] = cands[:30]
     return res
 
 
-async def _external_brief(pool: str, cands: list) -> str:
-    """用 Finnhub(若配置)拉真实新闻/财报, 作为 AI 选品的权威外部信息。无 key 返回空。"""
+async def _safe_await(coro, default):
+    try:
+        return await coro
+    except Exception:
+        return default
+
+
+def _fh_news_ms(n: dict) -> Optional[int]:
+    """Finnhub 新闻 datetime 是 epoch 秒 -> UTC ms。"""
+    try:
+        v = n.get("datetime")
+        return int(float(v) * 1000) if v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _iso_to_ms(s) -> Optional[int]:
+    import datetime as _dt
+    if not s:
+        return None
+    try:
+        return int(_dt.datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return None
+
+
+async def _evidence_for_pick(pool: str, cands: list) -> dict:
+    """AI 选品用: 聚合【多源、带出处与时间戳】的资讯 -> {brief: 文本, by_ticker: 每股事件标签}。
+    源: Finnhub 新闻/财报 + CryptoPanic/RSS 加密新闻 + TradingEconomics 经济日历。全部 fail-closed。
+    刻意不接任何裸社媒(X/TG/Reddit) —— 对抗性、易被操纵, 风控评审明确排除。"""
+    import datetime as _dt
+
+    from ..events import provenance as prov
+    from ..events.coingecko import CoinGeckoClient
+    from ..events.cryptonews import CryptoNewsClient
+    from ..events.econ_calendar import EconCalendarClient
     from ..events.finnhub import FinnhubClient
     from ..risk.engine import is_stock_perp
-    import datetime as _dt
-    fh = FinnhubClient(Secrets().finnhub_api_key)
-    if not fh.enabled:
-        return ""
-    lines = []
+    s = Secrets()
+    ref = prov.now_ms()
+    items: list = []        # 已发生 (新闻/财报)
+    sched: list = []        # 未来排定 (经济日历)
+    market: list = []       # 行情/大盘快照 (CoinGecko)
+    by_ticker: dict = {}
+    fh = FinnhubClient(s.finnhub_api_key)
+    cn = CryptoNewsClient(s.cryptopanic_api_key, s.crypto_news_rss_url)
+    ec = EconCalendarClient(s.econ_calendar_api_key)
+    cg = CoinGeckoClient(s.coingecko_api_key)
     try:
-        if pool in ("crypto", "all"):
-            news = await fh.general_news("crypto") or await fh.general_news("general")
+        if pool in ("crypto", "all") and cn.enabled:
+            coins = [c["inst"].split("-")[0].upper() for c in cands if not is_stock_perp(c["inst"])][:8]
+            items += await _safe_await(cn.headlines(currencies=coins or None, limit=8), [])
+        if pool in ("crypto", "all") and fh.enabled:
+            news = (await _safe_await(fh.general_news("crypto"), [])
+                    or await _safe_await(fh.general_news("general"), []))
             for n in (news or [])[:5]:
                 h = str(n.get("headline", "")).strip()
                 if h:
-                    lines.append("新闻· " + h[:90])
-        if pool in ("stock", "all"):
+                    items.append(prov.Evidence("news", "Finnhub", h[:120], url=str(n.get("url", "")),
+                                               publish_ms=_fh_news_ms(n), ingest_ms=ref))
+        if pool in ("stock", "all") and fh.enabled:
             today = _dt.datetime.now(_dt.timezone.utc).date()
-            cal = await fh.earnings_calendar(str(today), str(today + _dt.timedelta(days=7)))
+            cal = await _safe_await(
+                fh.earnings_calendar(str(today), str(today + _dt.timedelta(days=7))), [])
             syms = {c["inst"].split("-")[0].upper() for c in cands if is_stock_perp(c["inst"])}
             for e in (cal or []):
-                if str(e.get("symbol", "")).upper() in syms:
-                    lines.append(f"财报· {e.get('symbol')} {e.get('date')}({e.get('hour', '')})")
-            lines = lines[:11]
-    except Exception:
-        pass
+                sym = str(e.get("symbol", "")).upper()
+                if sym in syms:
+                    by_ticker[sym] = f"财报{e.get('date')}({e.get('hour', '')})"
+                    items.append(prov.Evidence(
+                        "earnings", "Finnhub", f"{sym} 财报 {e.get('date')} {e.get('hour', '')}",
+                        ingest_ms=ref, symbol=sym, extra="临近财报, 波动放大"))
+        if ec.enabled:
+            sched += await _safe_await(ec.upcoming(hours_ahead=48), [])
+        if pool in ("crypto", "all") and cg.enabled:
+            market += await _safe_await(cg.market_context(), [])
     finally:
         await fh.aclose()
-    return "\n".join(lines)
+        await cn.aclose()
+        await ec.aclose()
+        await cg.aclose()
+    brief = prov.render_brief(items, ref, max_items=12)
+    mk = prov.render_brief(market, ref, max_items=4)
+    if mk:
+        brief = (brief + "\n— 加密大盘/趋势(CoinGecko) —\n" + mk) if brief else ("加密大盘:\n" + mk)
+    sc = prov.render_schedule(sched, ref, max_items=6)
+    if sc:
+        brief = (brief + "\n— 即将公布的重大数据(别盲目开仓) —\n" + sc) if brief else ("即将公布:\n" + sc)
+    return {"brief": brief, "by_ticker": by_ticker}
+
+
+async def _evidence_for_symbol(inst_id: str) -> str:
+    """单标的分析用: 该标的相关的【带出处与时间】新闻/财报/SEC filing/经济日历。fail-closed。"""
+    import datetime as _dt
+
+    from ..events import provenance as prov
+    from ..events.cryptonews import CryptoNewsClient
+    from ..events.econ_calendar import EconCalendarClient
+    from ..events.edgar import EdgarClient
+    from ..events.finnhub import FinnhubClient
+    from ..risk.engine import is_stock_perp, set_stock_symbols
+    cfg = Config.load()
+    set_stock_symbols(cfg.get("universe.stock_symbols", []))     # 确保 is_stock_perp 正确分类
+    s = Secrets()
+    base = inst_id.split("-")[0].upper()
+    stock = is_stock_perp(inst_id)
+    ref = prov.now_ms()
+    items: list = []
+    sched: list = []
+    fh = FinnhubClient(s.finnhub_api_key)
+    cn = CryptoNewsClient(s.cryptopanic_api_key, s.crypto_news_rss_url)
+    ec = EconCalendarClient(s.econ_calendar_api_key)
+    ed = EdgarClient(s.edgar_user_agent) if stock else None
+    try:
+        if stock and fh.enabled:
+            today = _dt.datetime.now(_dt.timezone.utc).date()
+            cnews = await _safe_await(
+                fh.company_news(base, str(today - _dt.timedelta(days=3)), str(today)), [])
+            for n in (cnews or [])[:6]:
+                h = str(n.get("headline", "")).strip()
+                if h:
+                    items.append(prov.Evidence("news", "Finnhub", h[:120], url=str(n.get("url", "")),
+                                               publish_ms=_fh_news_ms(n), ingest_ms=ref, symbol=base))
+            cal = await _safe_await(fh.earnings_calendar(
+                str(today), str(today + _dt.timedelta(days=14)), symbol=base), [])
+            for e in (cal or []):
+                if str(e.get("symbol", "")).upper() == base:
+                    items.append(prov.Evidence(
+                        "earnings", "Finnhub", f"{base} 财报 {e.get('date')} {e.get('hour', '')}",
+                        ingest_ms=ref, symbol=base, extra="临近财报, 波动放大、风险高"))
+        if stock and ed is not None:
+            await _safe_await(ed.load_ticker_map(), {})
+            cik = ed.cik_for(base)
+            if cik:
+                fil = await _safe_await(
+                    ed.recent_filings(cik, forms={"8-K", "4", "10-Q", "10-K"}, limit=6), [])
+                for f in (fil or [])[:5]:
+                    title = f"{f.get('form', '')} {f.get('items', '')}".strip()
+                    items.append(prov.Evidence(
+                        "filing", "SEC EDGAR", title or "SEC filing",
+                        url="https://www.sec.gov/cgi-bin/browse-edgar",
+                        publish_ms=_iso_to_ms(f.get("acceptance")), ingest_ms=ref, symbol=base))
+        if (not stock) and cn.enabled:
+            items += await _safe_await(cn.headlines(currencies=[base], limit=6), [])
+        if ec.enabled:
+            sched += await _safe_await(ec.upcoming(hours_ahead=24), [])
+    finally:
+        await fh.aclose()
+        await cn.aclose()
+        await ec.aclose()
+        if ed is not None:
+            await ed.aclose()
+    brief = prov.render_brief(items, ref, max_items=8)
+    sc = prov.render_schedule(sched, ref, max_items=4)
+    if sc:
+        brief = (brief + "\n— 即将公布的重大数据 —\n" + sc) if brief else ("即将公布:\n" + sc)
+    return brief
 
 
 async def _manual_cancel_all(inst_id) -> str:
@@ -1053,6 +1315,9 @@ async def _manual_set_leverage(inst_id, lever) -> str:
     blocked = _manual_open_guard()            # H-1: 熔断/只平仓态不允许加杠杆
     if blocked:
         return blocked
+    lvblk = _manual_leverage_guard(lever)     # P4: 杠杆上限闸门
+    if lvblk:
+        return lvblk
     rest, mode, mgn = _new_trade_rest()
     try:
         if not await _get_spec(rest, inst_id):

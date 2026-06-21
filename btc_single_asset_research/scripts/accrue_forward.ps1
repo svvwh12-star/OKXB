@@ -3,8 +3,13 @@
 # 由 Windows 计划任务 "OKXB_Forward_Accrue" 每 4 小时调用一次。
 # evaluate 已 fail-soft: 受限网络拒绝/空拉时本轮干净跳过(不崩); 数据只拉一次多周期复用(已提速)。
 $ErrorActionPreference = "Continue"
-$root   = "F:\临时\0609\OKXB"
-$py     = "C:\Python313\python.exe"
+# 自动定位项目根: 本脚本在 <root>\btc_single_asset_research\scripts\ -> 上溯两级 = 项目根。
+# 这样换电脑/换 U 盘盘符 (F:/H:/...) 都不用改路径。
+$root   = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+# 自动找 python: 优先 PATH 上的 python/py, 都没有再退回常见安装路径。
+$py     = (Get-Command python -ErrorAction SilentlyContinue).Source
+if (-not $py) { $py = (Get-Command py -ErrorAction SilentlyContinue).Source }
+if (-not $py) { $py = "C:\Python313\python.exe" }
 $script = Join-Path $root "btc_single_asset_research\scripts\run_forward_shadow.py"
 $env:PYTHONPATH = Join-Path $root "src"
 $env:LOKY_MAX_CPU_COUNT = "$([Environment]::ProcessorCount)"   # 静默 loky 无wmic的探测噪音(须在python启动前设)

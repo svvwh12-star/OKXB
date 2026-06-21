@@ -24,6 +24,10 @@ SEVERITIES = ["low", "medium", "high"]
 HORIZONS = ["intraday", "days", "weeks"]
 OPENAI_PROVIDERS = {"deepseek", "openai", "openai_compatible", "moonshot", "qwen", "kimi"}
 
+# 永久免责 (风控评审硬性要求): 这是信息聚合/决策辅助, 不是价格预测, 无已验证 edge。
+DISCLAIMER = ("⚠ 信息聚合与决策辅助, 非价格预测; 本项目两套独立严格研究均【未发现可验证 edge】。"
+              "AI 不自动下单, 每笔手动单仍走 RiskEngine 额度闸门; 请先 demo 验证。")
+
 SYSTEM = (
     "你是量化交易的事件风控分类器。给定某美股公司的一条新闻或 SEC filing 摘要, "
     "判断它对短线交易的风险。保守优先: 重大负面/不确定事件(重组/诉讼/调查/重大 8-K/财报临近)"
@@ -228,13 +232,18 @@ class LLMClassifier:
             "sl_px": qctx.get("sl_px"), "leverage": qctx.get("lev_suggest"),
             "size_usdt": qctx.get("size_usdt"), "confidence": 0.5,
             "rationale": "", "risks": "", "scaling": "",
+            "bull": "", "bear": "", "disconfirm": "",
         }
         if not self.enabled:
             return {"ok": False, "struct": defaults,
                     "text": "未配置 AI (当前=规则或未填 key)。已用【量化默认】填充方向/止盈止损/杠杆/仓位, "
                             "可直接『导入手动交易』。如需 AI 文字研判, 请到『账户与密钥』选 DeepSeek 填 Key。"}
-        sysp = ("你是严谨的加密/美股永续合约短线量化分析师。只允许基于【给定的客观盘口与因子数据】"
-                "与【已算好的风险量】做判断, 严禁编造新闻、财报、社媒或任何外部消息。"
+        sysp = ("你是严谨的加密/美股永续合约短线量化分析师。判断只能基于【给定的客观盘口与因子数据】、"
+                "【已算好的风险量】、以及【下方『外部事件简报』中带来源与时间戳的条目】。"
+                "严禁编造简报里没有的新闻/财报/社媒/数字; 简报为空就明说『无外部事件、纯盘口判断』。"
+                "【必须双向】: 同时给出 bull(看多理由)、bear(看空理由)、disconfirm(最强反证/什么会证明你错), "
+                "不得只给单边结论; 证据不足就给低置信度并如实说明。"
+                "【成本意识】: 结合给定往返成本 cost_pct, 若预期净空间不显著大于成本, 必须在 risks 里点明『成本占优, 不值得做』。"
                 "杠杆必须在 [3, {lvmax}] 内且优先采用给定的『量化建议杠杆』, 仅在有明确理由时小幅调整。"
                 "止盈/止损/入场价应贴近给定的量化默认值。"
                 "【铁律·挂单侧】若 order_type=post_only(挂单/maker), entry_px 必须落在 maker 侧: "
@@ -247,19 +256,25 @@ class LLMClassifier:
                   '"entry_px":number,"tp_px":number,"sl_px":number,"leverage":int,'
                   '"size_usdt":number,"confidence":number(0-1),'
                   '"rationale":"<=120字 结合OBI/OFI/趋势/波动/价差","risks":"<=80字",'
+                  '"bull":"<=80字 看多理由(可引用简报事件)","bear":"<=80字 看空理由",'
+                  '"disconfirm":"<=60字 最强反证/什么会证明你错",'
                   '"scaling":"<=80字 建仓/加仓/减仓节奏"}')
+        evidence_text = qctx.get("evidence_text") or "(无外部事件简报)"
         user = (f"标的: {inst}\n"
-                f"实时客观数据: 中间价={qctx.get('mid')} 价差bps={qctx.get('spread_bps')} "
-                f"OBI_z={qctx.get('obi_z')} OFI_z={qctx.get('ofi_z')} "
+                f"实时客观数据(时效={qctx.get('data_age') or '未知'}): 中间价={qctx.get('mid')} "
+                f"价差bps={qctx.get('spread_bps')} OBI_z={qctx.get('obi_z')} OFI_z={qctx.get('ofi_z')} "
                 f"趋势分量={qctx.get('trend_dir')} 流向分量={qctx.get('flow_dir')} "
                 f"做多分={qctx.get('long')} 做空分={qctx.get('short')} "
-                f"ATR(1m)={qctx.get('atr')} 已实现波动60s={qctx.get('rvol')}\n"
+                f"ATR(1m)={qctx.get('atr')} 已实现波动60s={qctx.get('rvol')} "
+                f"资金费率={qctx.get('funding_rate')}\n"
+                f"往返成本≈{qctx.get('cost_pct')} (手续费+半价差+滑点; 预期净空间须显著大于它, 否则别做)\n"
                 f"代码已算好的客观默认(请贴近并校准): 方向先验={qctx.get('dir_prior')} "
                 f"止损%={qctx.get('sl_pct')} 止盈%={qctx.get('tp_pct')} "
                 f"入场价={qctx.get('entry_px')} 止盈价={qctx.get('tp_px')} 止损价={qctx.get('sl_px')} "
                 f"量化建议杠杆={qctx.get('lev_suggest')}x (上限{qctx.get('lev_max')}x, "
                 f"依据: 逐仓下止损亏损≈保证金的{int(qctx.get('target_risk',0.1)*100)}%) "
-                f"建议下单额USDT={qctx.get('size_usdt')}\n\n"
+                f"建议下单额USDT={qctx.get('size_usdt')}\n"
+                f"外部事件简报(只能引用这里、带来源与时间的条目, 不得编造其它):\n{evidence_text}\n\n"
                 f"只输出一个 JSON 对象: {schema}")
         try:
             d = await self._chat_json(self._json_model(), sysp, user, max_tokens=1200)
@@ -293,7 +308,7 @@ class LLMClassifier:
             out["confidence"] = max(0.0, min(1.0, float(d.get("confidence", 0.5))))
         except (TypeError, ValueError):
             out["confidence"] = 0.5
-        for k in ("rationale", "risks", "scaling"):
+        for k in ("rationale", "risks", "scaling", "bull", "bear", "disconfirm"):
             if isinstance(d.get(k), str):
                 out[k] = d[k][:200]
         # 安全网: 强制 maker 侧。post_only 下若 AI 把入场价放错一侧(做空给≤现价、做多给≥现价),
@@ -324,10 +339,10 @@ class LLMClassifier:
         if not candidates:
             return {"ok": False, "picks": [], "text": "无候选数据 (请先启动引擎积累实时行情)。"}
         has_brief = bool(external_brief and external_brief.strip())
-        news_rule = ("下方提供了【真实外部资讯(Finnhub 新闻/财报日历)】, 请结合它与量化快照综合判断, "
-                     "可引用其中的事件, 但不得编造未给出的消息。"
+        news_rule = ("下方【真实外部资讯简报】每条都带来源与时间戳(新闻/财报/经济日历), 请结合它与量化快照综合判断; "
+                     "只能引用简报里列出的事件, 严禁编造简报里没有的消息/社媒/数字。"
                      if has_brief else
-                     "本接口无联网, 你看不到实时新闻, 严禁编造新闻/社媒; 可用你已有常识做定性补充。")
+                     "本次无外部资讯简报, 你看不到实时新闻, 严禁编造新闻/社媒; 可用已有常识做定性补充并给低置信度。")
         sysp = ("你是加密/美股永续合约短线选品分析师。基于【客观量化快照 + 交易所真实24h行情】"
                 "(双向信号分、波动ATR、价差、近端动量、24h真实涨跌幅/成交额)排序与推荐。"
                 + news_rule +
@@ -341,7 +356,7 @@ class LLMClassifier:
         schema = ('{"picks":[{"inst":"...","direction":"long|short","strategy":"顺势/反转/突破/basis",'
                   '"leverage":int(3-50),"confidence":number(0-1),"reason":"<=80字","risk":"<=60字"}],'
                   '"note":"<=80字 总体提示"}')
-        brief_block = (f"\n真实外部资讯(Finnhub):\n{external_brief}\n" if has_brief else "")
+        brief_block = (f"\n真实外部资讯(多源·每条带来源/时间):\n{external_brief}\n" if has_brief else "")
         user = (f"候选池: {pool_label}\n候选(已按量化机会分排序):\n" + "\n".join(lines) +
                 brief_block +
                 f"\n请挑出最多5个最具短线机会的标的, 只输出 JSON: {schema}")
@@ -540,19 +555,27 @@ def _render_analysis(inst: str, s: dict, qctx: dict) -> str:
              f"使止损亏损≈保证金的{int(qctx.get('target_risk', 0.1)*100)}%, 上限{qctx.get('lev_max')}x)",
              f"建议下单额: {s.get('size_usdt')} USDT (按单笔风险预算)",
              f"理由: {s.get('rationale') or '-'}",
+             f"✅ 看多依据: {s.get('bull') or '-'}",
+             f"❎ 看空依据: {s.get('bear') or '-'}",
+             f"🔎 最强反证(什么会证明这判断错): {s.get('disconfirm') or '-'}",
              f"风险: {s.get('risks') or '-'}",
-             f"建/减仓: {s.get('scaling') or '-'}",
-             "—— 点『⬇ 导入手动交易』把以上参数填入下单区(不会自动下单, 你确认后再点下单)。",
-             "注: 入场价是【挂单(maker)参考】, 真正下单时会按当时盘口校正到正确一侧; 价已过期则被重排。",
-             "仅供参考, 非投资建议。"]
+             f"往返成本≈{qctx.get('cost_pct')} (预期净空间须显著大于它, 否则是白交手续费)",
+             f"建/减仓: {s.get('scaling') or '-'}"]
+    ev = qctx.get("evidence_text")
+    if ev:
+        lines.append("—— 本次喂给 AI 的外部事件(带来源/时间, 可自行核对) ——\n" + ev)
+    lines += [
+        "—— 点『⬇ 导入手动交易』把以上参数填入下单区(不会自动下单, 你确认后再点下单)。",
+        "注: 入场价是【挂单(maker)参考】, 真正下单时会按当时盘口校正到正确一侧; 价已过期则被重排。",
+        DISCLAIMER]
     return "\n".join(lines)
 
 
 def _render_picks(pool_label: str, picks: list, note: str) -> str:
     if not picks:
         return f"[{pool_label}] AI 未给出推荐。"
-    lines = [f"【AI 选品 · {pool_label}】(基于实时信号分+交易所24h真实涨跌+模型常识; "
-             "无联网实时新闻/社媒; 仅供参考)"]
+    lines = [f"【AI 选品 · {pool_label}】(基于实时信号分+交易所24h真实涨跌+带出处的外部资讯简报; "
+             "不含裸社媒)"]
     for i, p in enumerate(picks, 1):
         lines.append(f"{i}. {p['inst']}  {_DIR_CN.get(p['direction'], p['direction'])}  "
                      f"策略={p['strategy']}  {p['leverage']}x  置信{p['confidence']:.0%}")
@@ -561,7 +584,8 @@ def _render_picks(pool_label: str, picks: list, note: str) -> str:
             lines.append(f"    风险: {p['risk']}")
     if note:
         lines.append(f"提示: {note}")
-    lines.append("点某条右侧『导入』可带入手动交易。非投资建议。")
+    lines.append("点某条右侧『导入』可带入手动交易。")
+    lines.append(DISCLAIMER)
     return "\n".join(lines)
 
 

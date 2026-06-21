@@ -20,7 +20,8 @@ from .controller import (PARAM_DEFS, EngineController, account_brief_sync, ai_an
                          manual_bracket_sync, manual_cancel_all_sync, manual_close_all_sync,
                          manual_close_sync, manual_place_sync, manual_set_leverage_sync,
                          read_env, run_calibration_sync, save_preset, stock_symbol_set,
-                         verify_ai_sync, verify_edgar_sync, verify_finnhub_sync,
+                         verify_ai_sync, verify_coingecko_sync, verify_cryptonews_sync,
+                         verify_econ_sync, verify_edgar_sync, verify_finnhub_sync,
                          verify_okx_sync, verify_telegram_sync, write_env)
 
 ctk.set_appearance_mode("dark")
@@ -103,6 +104,11 @@ class OKXBApp(ctk.CTk):
             self._stock_set = set()
 
         self._build_header()
+        ctk.CTkLabel(
+            self, text="ⓘ AI选品/分析 = 信息聚合与决策辅助, 非价格预测·无已验证 edge; "
+                       "AI 不自动下单, 每笔手动单仍走 RiskEngine 额度闸门 · 建议先 demo 验证。",
+            font=("Microsoft YaHei UI", 11), text_color="#d08770",
+            anchor="w", wraplength=1400, justify="left").pack(fill="x", padx=14, pady=(0, 4))
         self._tabs = ctk.CTkTabview(self, width=1000, height=560)
         self._tabs.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self._tab_console = self._tabs.add("控制台")
@@ -702,9 +708,18 @@ class OKXBApp(ctk.CTk):
 
         ctk.CTkLabel(scroll, text="可选: 外部数据 (留空则用免费源/规则)",
                      font=FONT_B, anchor="w").pack(fill="x", pady=(12, 2))
-        self._opt_entry(scroll, "FINNHUB_API_KEY (财报日历)", "FINNHUB_API_KEY", env)
+        self._opt_entry(scroll, "FINNHUB_API_KEY (财报日历+新闻)", "FINNHUB_API_KEY", env)
         self._opt_entry(scroll, "EDGAR_USER_AGENT (姓名 邮箱, SEC 合规要求)",
                         "EDGAR_USER_AGENT", env, mask=False)
+        self._opt_entry(scroll, "CRYPTOPANIC_API_KEY (加密新闻聚合, 需 token)",
+                        "CRYPTOPANIC_API_KEY", env)
+        self._opt_entry(scroll, "CRYPTO_NEWS_RSS_URL (加密新闻RSS, 无需key)",
+                        "CRYPTO_NEWS_RSS_URL", env, mask=False,
+                        default="https://www.coindesk.com/arc/outboundfeeds/rss/")
+        self._opt_entry(scroll, "TRADING_ECONOMICS_API_KEY (经济日历, 可空)",
+                        "TRADING_ECONOMICS_API_KEY", env, mask=False)
+        self._opt_entry(scroll, "COINGECKO_API_KEY (行情/大盘数据, 非新闻)",
+                        "COINGECKO_API_KEY", env)
 
         # ---- AI 事件分类 (提供商无关) ----
         ctk.CTkLabel(scroll, text="AI 事件分类 (新闻/公告智能判断; 选『规则』则免费, 不调用任何AI)",
@@ -765,7 +780,16 @@ class OKXBApp(ctk.CTk):
         ctk.CTkButton(btns, text="🔍 验证TG", font=FONT_B, width=92, fg_color="#3a7ebf",
                       command=lambda: self._on_verify("tg")).pack(side="left", padx=4)
 
-        ctk.CTkLabel(scroll, text="验证结果 (3个分别验证):", font=FONT, anchor="w").pack(fill="x", pady=(8, 0))
+        btns2 = ctk.CTkFrame(scroll, fg_color="transparent")
+        btns2.pack(fill="x", pady=(0, 4))
+        ctk.CTkButton(btns2, text="🔍 验证加密新闻", font=FONT_B, width=140, fg_color="#3a7ebf",
+                      command=lambda: self._on_verify("cryptonews")).pack(side="left", padx=4)
+        ctk.CTkButton(btns2, text="🔍 验证经济日历", font=FONT_B, width=140, fg_color="#3a7ebf",
+                      command=lambda: self._on_verify("econ")).pack(side="left", padx=4)
+        ctk.CTkButton(btns2, text="🔍 验证CoinGecko", font=FONT_B, width=144, fg_color="#3a7ebf",
+                      command=lambda: self._on_verify("coingecko")).pack(side="left", padx=4)
+
+        ctk.CTkLabel(scroll, text="验证结果 (各源分别验证):", font=FONT, anchor="w").pack(fill="x", pady=(8, 0))
         self.verify_box = ctk.CTkTextbox(scroll, height=180, font=MONO)
         self.verify_box.pack(fill="x", pady=4)
         self.verify_box.insert("end", "填入密钥 → 保存 → 验证。密钥仅存本机 .env, 不外传。\n"
@@ -1542,7 +1566,8 @@ class OKXBApp(ctk.CTk):
     def _on_verify(self, kind: str) -> None:
         self._save_credentials_silent()
         names = {"demo": "虚拟盘", "live": "实盘", "ai": "AI", "tg": "Telegram",
-                 "finnhub": "Finnhub", "edgar": "EDGAR"}
+                 "finnhub": "Finnhub", "edgar": "EDGAR",
+                 "cryptonews": "加密新闻", "econ": "经济日历", "coingecko": "CoinGecko"}
         self._set_verify_text(f"正在验证 {names.get(kind, kind)} ...")
 
         def work():
@@ -1554,6 +1579,12 @@ class OKXBApp(ctk.CTk):
                 result = verify_finnhub_sync()
             elif kind == "edgar":
                 result = verify_edgar_sync()
+            elif kind == "cryptonews":
+                result = verify_cryptonews_sync()
+            elif kind == "econ":
+                result = verify_econ_sync()
+            elif kind == "coingecko":
+                result = verify_coingecko_sync()
             else:
                 result = verify_okx_sync(kind)
             self.after(0, lambda: self._set_verify_text(result))

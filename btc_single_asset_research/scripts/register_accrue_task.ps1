@@ -1,12 +1,13 @@
 ﻿# 一次性注册计划任务 OKXB_Forward_Accrue —— 每 4 小时无人值守跑 BTC + ETH + 股票(ST720) 的 forward evaluate。
 # 需【管理员】运行(注册计划任务要提权)。两种方式任选其一:
 #   A) 右键本文件 → "使用 PowerShell 运行"(若弹 UAC 选是);
-#   B) 开一个【管理员】PowerShell(Win+X → 终端(管理员)), 执行:
-#        powershell -ExecutionPolicy Bypass -File "F:\临时\0609\OKXB\btc_single_asset_research\scripts\register_accrue_task.ps1"
+#   B) 开一个【管理员】PowerShell(Win+X → 终端(管理员)), 执行 (路径换成本文件的真实位置):
+#        powershell -ExecutionPolicy Bypass -File "<本文件完整路径>\register_accrue_task.ps1"
 # 设计为【一次成功】: 三种注册方法依次回退, 至少一种会成功; 末尾自检 + 立即试跑一次确认能真跑。
+# 路径自动定位(不依赖盘符); 注: 计划任务记录的是注册时的绝对路径, 若 U 盘盘符日后变化, 重跑本脚本即可。
 $ErrorActionPreference = "Stop"
 $name = "OKXB_Forward_Accrue"
-$runner = "F:\临时\0609\OKXB\btc_single_asset_research\scripts\accrue_forward.ps1"
+$runner = Join-Path $PSScriptRoot "accrue_forward.ps1"
 $desc = "OKXB forward 累积 (BTC+ETH+股票ST720 evaluate, 每4h)"
 
 # --- 前置自检 ---
@@ -68,7 +69,7 @@ try {
 Write-Host "立即试跑一次以验证 (约 1 分钟, 后台静默)..." -ForegroundColor Cyan
 try { Start-ScheduledTask -TaskName $name } catch { Write-Host "  Start 失败: $($_.Exception.Message)" -ForegroundColor DarkYellow }
 Start-Sleep -Seconds 8
-$log = "F:\临时\0609\OKXB\btc_single_asset_research\forward\accrue.log"
+$log = Join-Path (Split-Path -Parent $PSScriptRoot) "forward\accrue.log"
 Write-Host "几分钟后看日志确认三段(btc/eth/stock)都跑了:" -ForegroundColor Cyan
 Write-Host ('  Get-Content "' + $log + '" -Tail 25')
 Write-Host "以后想停掉: Unregister-ScheduledTask $name -Confirm:`$false"

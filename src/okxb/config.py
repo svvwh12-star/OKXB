@@ -67,6 +67,13 @@ class Secrets:
 
         self.edgar_user_agent = os.getenv("EDGAR_USER_AGENT", "")
         self.finnhub_api_key = os.getenv("FINNHUB_API_KEY", "")
+        # 加密新闻 (CryptoPanic 需 token; RSS 无需 key, 默认 CoinDesk) + 经济日历 (TradingEconomics)
+        # 全部 fail-closed: 留空即休眠, 不影响其它功能。社会/政治裸社媒【刻意不接】(对抗性, 易被操纵)。
+        self.cryptopanic_api_key = os.getenv("CRYPTOPANIC_API_KEY", "")
+        self.crypto_news_rss_url = os.getenv("CRYPTO_NEWS_RSS_URL", "")
+        self.econ_calendar_api_key = os.getenv("TRADING_ECONOMICS_API_KEY", "")
+        # CoinGecko demo key: 行情/大盘数据(非新闻) — 全球市值/BTC占比/热搜趋势, 喂给 AI 选品
+        self.coingecko_api_key = os.getenv("COINGECKO_API_KEY", "")
 
         # AI 事件分类: 提供商无关 (DeepSeek / OpenAI兼容 / Claude); 简单任务用便宜模型, 复杂任务用强模型
         self.ai_provider = os.getenv("AI_PROVIDER", "rule").strip().lower()

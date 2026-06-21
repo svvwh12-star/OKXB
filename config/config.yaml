@@ -110,6 +110,11 @@ risk:
     total_halve_at: -30
     total_reduce_only_at: -40
     total_killswitch_at: -50
+  # P4 手动下单闸门 (引擎在不在跑都生效; 防"虚假信心->重仓"。平仓/撤单不受限)
+  manual_max_notional_per_trade_usdt: 2500    # 单笔开仓名义上限
+  manual_max_notional_per_day_usdt: 10000     # 单日手动开仓名义累计上限
+  manual_max_trades_per_day: 30               # 单日手动开仓笔数上限 (防过度交易)
+  manual_max_leverage: 50                     # 单笔杠杆上限
 
 signal:
   # 入场 = 方向分>=门槛(主) + 可交易性>=门槛 + 1个确认(流向/趋势一致>=confirm_min) + 连续persist_ticks拍 + 冷却 + 净edge。
