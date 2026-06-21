@@ -52,9 +52,10 @@ def main() -> None:
     dvol_d = dvol.rename(columns={"dvol": "value"})
 
     panel = rf.build_reversal_panel(dfs, "15m", k_lookback=2, h_fwd=2)
-    panel = rf.attach_regime(panel, dvol_d, "dvol_hi", mode="above_median")
-    panel = rf.attach_regime(panel, vrp_d, "vrp_pos", mode="positive")
-    panel = rf.attach_regime(panel, fund[["ts", "value"]], "fund_extreme", mode="abs_extreme")
+    # RV-6/RV-8: 日频制度并到日内信号必须按"周期收盘后才可得"对齐 (DAY_MS), 否则跨日前视
+    panel = rf.attach_regime(panel, dvol_d, "dvol_hi", publish_lag_ms=rf.DAY_MS, mode="above_median")
+    panel = rf.attach_regime(panel, vrp_d, "vrp_pos", publish_lag_ms=rf.DAY_MS, mode="positive")
+    panel = rf.attach_regime(panel, fund[["ts", "value"]], "fund_extreme", publish_lag_ms=rf.DAY_MS, mode="abs_extreme")
 
     rows = rf.eval_regimes(panel, ["dvol_hi", "vrp_pos", "fund_extreme"])
     ok, msg = rf.verdict(rows)

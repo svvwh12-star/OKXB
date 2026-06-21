@@ -18,6 +18,8 @@ import pandas as pd
 from . import candle_research as cr
 from .daily_panel import pit_asof_join
 
+DAY_MS = 86_400_000
+
 
 def _log(m: str) -> None:
     print(m, flush=True)
@@ -42,10 +44,13 @@ def build_reversal_panel(dfs: dict[str, pd.DataFrame], bar: str,
 
 
 def attach_regime(panel: pd.DataFrame, daily: pd.DataFrame, name: str, *,
-                  publish_lag_ms: int = 0, mode: str = "above_median",
+                  publish_lag_ms: int, mode: str = "above_median",
                   min_periods: int = 20) -> pd.DataFrame:
     """Attach a binary market-wide regime column from a daily series (ts,value), point-in-time.
-    mode='above_median' (vs expanding trailing median) | 'positive' (value>0) | 'abs_extreme' (|z|>1)."""
+    mode='above_median' (vs expanding trailing median) | 'positive' (value>0) | 'abs_extreme' (|z|>1).
+
+    RV-6/RV-8: publish_lag_ms is REQUIRED (no default) — attaching a DAILY regime to an INTRADAY
+    panel with lag 0 silently leaks same-day (not-yet-closed) info. Pass DAY_MS for a daily series."""
     ts = np.sort(panel["ts"].unique())
     val = pit_asof_join(ts, daily["ts"].to_numpy(np.int64), daily["value"].to_numpy(float), publish_lag_ms)
     s = pd.Series(val)

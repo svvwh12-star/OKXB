@@ -20,6 +20,7 @@ import pandas as pd
 from . import candle_research as cr
 from . import feature_lab as fl
 from . import horizon_model as hm
+from . import labeling   # RV-5: Deflated Sharpe + PBO 接入判决门
 
 try:
     from sklearn.ensemble import (
@@ -315,6 +316,7 @@ def evaluate_scores(
     costs: WorkflowCosts = WorkflowCosts(),
     mode: str = "cross_sectional",
     fracs: tuple[float, ...] = (0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 1.0),
+    n_trials: int = 1,
 ) -> dict:
     """Evaluate directional scores. Positive score means long, negative means short."""
     if len(oos) < 300:
@@ -339,6 +341,7 @@ def evaluate_scores(
     sub["conf"] = sub["score"].abs()
     have_train = len(train_abs_score) > 100 and np.nanmax(train_abs_score) > 0
     curve = []
+    frac_nets: dict[float, list] = {}      # RV-5: 每个置信档的【扣 taker 后】每-rebalance 净收益序列
     for fr in fracs:
         thr = 0.0 if fr >= 1.0 else (
             float(np.nanquantile(train_abs_score, 1 - fr)) if have_train else float(sub["conf"].quantile(1 - fr))
@@ -368,7 +371,15 @@ def evaluate_scores(
             key = str(int(round(c)))
             cell[f"net_{key}"] = st["net_bps"] if st else np.nan
             cell[f"t_{key}"] = st["nw_t"] if st else np.nan
+        frac_nets[fr] = (port - costs.taker_bps / 1e4).tolist()
         curve.append((fr, cell))
+    # RV-5: 紧缩夏普(DSR) + 过拟合概率(PBO) —— 把已实现的 labeling 统计接进判决, 防小样本/多档假阳
+    dsr = pbo = None
+    if frac_nets:
+        best_fr = max(frac_nets, key=lambda fr: (float(np.mean(frac_nets[fr])) if frac_nets[fr] else -1e9))
+        dsr = labeling.deflated_sharpe(frac_nets[best_fr], n_trials=max(1, int(n_trials)))
+        _pbo = labeling.pbo_cscv(frac_nets)
+        pbo = _pbo[0] if _pbo else None
     return {
         "n": len(clean),
         "auc": float(auc) if np.isfinite(auc) else np.nan,
@@ -378,6 +389,8 @@ def evaluate_scores(
         "xs_t": cr._nw_t(xs.values) if len(xs) > 5 else np.nan,
         "winrate": winrate_all,
         "curve": curve,
+        "dsr": dsr,
+        "pbo": pbo,
     }
 
 

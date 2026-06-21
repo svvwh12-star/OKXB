@@ -15,6 +15,11 @@ from . import pro_model_workflow as pmw
 from .daily_panel import pit_asof_join
 
 DAY_MS = 86_400_000
+# RV-6/RV-8: 外部源 PIT 发布延迟集中声明 (不再散落魔法数 0)。
+FUNDING_PUBLISH_LAG_MS = 0          # funding 结算时刻即已实现, ts=结算时间 -> 0 正确
+# 日频隐含波动: 保守默认按"周期收盘后才可得"对齐 (跨日前视的安全侧;
+# 若确认 deribit DVOL 的 ts 即为当日收盘时刻, 可在调用处把 dvol_lag_ms 设回 0)。
+DVOL_PUBLISH_LAG_MS = DAY_MS
 
 
 def _log(m: str) -> None:
@@ -45,6 +50,7 @@ def build_daily_orthogonal_bank(
     dvol_by_ccy: Optional[dict[str, pd.DataFrame]] = None,
     onchain_by_asset: Optional[dict[str, dict[str, pd.DataFrame]]] = None,
     onchain_lag_ms: int = DAY_MS,
+    dvol_lag_ms: int = DVOL_PUBLISH_LAG_MS,
 ) -> tuple[pd.DataFrame, int]:
     """Daily bank = inst_bank price/vol base + basis/funding + DVOL/VRP + on-chain + cross-asset.
 
@@ -90,7 +96,7 @@ def build_daily_orthogonal_bank(
         f = funding_dfs.get(inst)
         if f is not None and len(f):
             fd = f.sort_values("ts").rename(columns={"funding": "value"})[["ts", "value"]]
-            last = merge_pit(ts, fd, 0)
+            last = merge_pit(ts, fd, FUNDING_PUBLISH_LAG_MS)
             p["funding_last"] = last
             p["funding_z"] = _zscore(last, max(6, hb * 3))
             p["funding_cum_h"] = pd.Series(last).rolling(max(1, hb)).sum().to_numpy()
@@ -102,7 +108,7 @@ def build_daily_orthogonal_bank(
         # --- DVOL / VRP (implied vol; daily index) ---
         dv = dvol_by_ccy.get(_ccy(inst))
         if dv is not None and len(dv):
-            dvol = merge_pit(ts, dv.rename(columns={"dvol": "value"})[["ts", "value"]], 0)
+            dvol = merge_pit(ts, dv.rename(columns={"dvol": "value"})[["ts", "value"]], dvol_lag_ms)
             p["dvol"] = dvol
             p["dvol_chg"] = pd.Series(dvol).diff(max(1, hb)).to_numpy()
             logret = np.log(pc).diff()
@@ -172,15 +178,23 @@ def run_daily(
             return comp
         metrics: dict = {}
         best = None
+        # RV-5: DSR/PBO 的多重检验试验数 = 模型数 × 置信档数(7) × 周期数 (整个搜索空间)
+        n_trials = max(1, len(comp["models"]) * 7 * len(horizons_min))
         for name, (odf, train_abs) in comp["models"].items():
-            mm = pmw.evaluate_scores(odf, H, bar_ms, train_abs, costs=costs, mode=mode) if len(odf) else {"skip": True}
+            mm = (pmw.evaluate_scores(odf, H, bar_ms, train_abs, costs=costs, mode=mode, n_trials=n_trials)
+                  if len(odf) else {"skip": True})
             metrics[name] = mm
             if mm.get("skip"):
                 continue
             cells = [(fr, c) for fr, c in mm["curve"] if c is not None]
             pass_cells = [(fr, c) for fr, c in cells if pmw._cell_pass(c, costs, min_ts=min_cell_ts)]
             stress_cells = [(fr, c) for fr, c in pass_cells if pmw._stress_pass(c, costs)]
-            gate = (mm.get("primary_ic", 0.0) > 0.01 and len(pass_cells) >= 2 and len(stress_cells) >= 1)
+            # RV-5: 除净edge闸门外, 还须通过 Deflated Sharpe(>=0.95) 与 PBO(<0.5); 否则不判 edge_ok。
+            # 方向: 只会让门更严 (防小样本/多档过拟合的假 PASS), 不会凭空制造 PASS。
+            dsr_ok = (mm.get("dsr") is not None and mm["dsr"] >= 0.95)
+            pbo_ok = (mm.get("pbo") is None or mm["pbo"] < 0.5)
+            gate = (mm.get("primary_ic", 0.0) > 0.01 and len(pass_cells) >= 2 and len(stress_cells) >= 1
+                    and dsr_ok and pbo_ok)
             score_cell = max(cells, key=lambda fc: (fc[1].get("net_4", -1e9), fc[1].get("t_4", -1e9)),
                              default=(None, None))
             cand = {"model": name, "gate": gate, "best_frac": score_cell[0],
