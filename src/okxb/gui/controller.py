@@ -262,6 +262,28 @@ async def _averify_cryptonews() -> str:
         await cn.aclose()
 
 
+def verify_stocknews_sync() -> str:
+    try:
+        return asyncio.run(_averify_stocknews())
+    except Exception as e:
+        return f"美股新闻验证失败: {e!r}"
+
+
+async def _averify_stocknews() -> str:
+    from ..events.stocknews import StockNewsClient
+    sn = StockNewsClient()
+    try:
+        items = await sn.headlines("AAPL", limit=5)
+        if not items:
+            return ("美股新闻 RSS 本次未取到 (网络/被限流, 可稍后重试)。\n"
+                    "源: Google News + Yahoo Finance, 无需 key; 单标的分析美股时会自动带上。")
+        sample = "\n".join(f"  · {it.source}: {it.title[:60]}" for it in items[:3])
+        return (f"美股新闻连通 ✓ (Google News + Yahoo, 无需 key)\nAAPL 拉到 {len(items)} 条:\n{sample}\n"
+                "点某只美股『🤖AI分析』时会自动带上(带来源/时间)。")
+    finally:
+        await sn.aclose()
+
+
 def verify_coingecko_sync() -> str:
     try:
         return asyncio.run(_averify_coingecko())
@@ -1208,6 +1230,7 @@ async def _evidence_for_symbol(inst_id: str) -> str:
     from ..events.econ_calendar import EconCalendarClient
     from ..events.edgar import EdgarClient
     from ..events.finnhub import FinnhubClient
+    from ..events.stocknews import StockNewsClient
     from ..risk.engine import is_stock_perp, set_stock_symbols
     cfg = Config.load()
     set_stock_symbols(cfg.get("universe.stock_symbols", []))     # 确保 is_stock_perp 正确分类
@@ -1221,6 +1244,7 @@ async def _evidence_for_symbol(inst_id: str) -> str:
     cn = CryptoNewsClient(s.cryptopanic_api_key, s.crypto_news_rss_url)
     ec = EconCalendarClient(s.econ_calendar_api_key)
     ed = EdgarClient(s.edgar_user_agent) if stock else None
+    sn = StockNewsClient() if stock else None       # 美股新闻 RSS (Google News + Yahoo, 无需 key)
     try:
         if stock and fh.enabled:
             today = _dt.datetime.now(_dt.timezone.utc).date()
@@ -1250,6 +1274,8 @@ async def _evidence_for_symbol(inst_id: str) -> str:
                         "filing", "SEC EDGAR", title or "SEC filing",
                         url="https://www.sec.gov/cgi-bin/browse-edgar",
                         publish_ms=_iso_to_ms(f.get("acceptance")), ingest_ms=ref, symbol=base))
+        if stock and sn is not None:
+            items += await _safe_await(sn.headlines(base, limit=6), [])
         if (not stock) and cn.enabled:
             items += await _safe_await(cn.headlines(currencies=[base], limit=6), [])
         if ec.enabled:
@@ -1260,6 +1286,8 @@ async def _evidence_for_symbol(inst_id: str) -> str:
         await ec.aclose()
         if ed is not None:
             await ed.aclose()
+        if sn is not None:
+            await sn.aclose()
     brief = prov.render_brief(items, ref, max_items=8)
     sc = prov.render_schedule(sched, ref, max_items=4)
     if sc:

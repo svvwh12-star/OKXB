@@ -22,7 +22,8 @@ from .controller import (PARAM_DEFS, EngineController, account_brief_sync, ai_an
                          read_env, run_calibration_sync, save_preset, stock_symbol_set,
                          verify_ai_sync, verify_coingecko_sync, verify_cryptonews_sync,
                          verify_econ_sync, verify_edgar_sync, verify_finnhub_sync,
-                         verify_okx_sync, verify_telegram_sync, write_env)
+                         verify_okx_sync, verify_stocknews_sync, verify_telegram_sync,
+                         write_env)
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -788,6 +789,8 @@ class OKXBApp(ctk.CTk):
                       command=lambda: self._on_verify("econ")).pack(side="left", padx=4)
         ctk.CTkButton(btns2, text="🔍 验证CoinGecko", font=FONT_B, width=144, fg_color="#3a7ebf",
                       command=lambda: self._on_verify("coingecko")).pack(side="left", padx=4)
+        ctk.CTkButton(btns2, text="🔍 验证美股新闻", font=FONT_B, width=140, fg_color="#3a7ebf",
+                      command=lambda: self._on_verify("stocknews")).pack(side="left", padx=4)
 
         ctk.CTkLabel(scroll, text="验证结果 (各源分别验证):", font=FONT, anchor="w").pack(fill="x", pady=(8, 0))
         self.verify_box = ctk.CTkTextbox(scroll, height=180, font=MONO)
@@ -1567,7 +1570,8 @@ class OKXBApp(ctk.CTk):
         self._save_credentials_silent()
         names = {"demo": "虚拟盘", "live": "实盘", "ai": "AI", "tg": "Telegram",
                  "finnhub": "Finnhub", "edgar": "EDGAR",
-                 "cryptonews": "加密新闻", "econ": "经济日历", "coingecko": "CoinGecko"}
+                 "cryptonews": "加密新闻", "econ": "经济日历", "coingecko": "CoinGecko",
+                 "stocknews": "美股新闻"}
         self._set_verify_text(f"正在验证 {names.get(kind, kind)} ...")
 
         def work():
@@ -1585,6 +1589,8 @@ class OKXBApp(ctk.CTk):
                 result = verify_econ_sync()
             elif kind == "coingecko":
                 result = verify_coingecko_sync()
+            elif kind == "stocknews":
+                result = verify_stocknews_sync()
             else:
                 result = verify_okx_sync(kind)
             self.after(0, lambda: self._set_verify_text(result))

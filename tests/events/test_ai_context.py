@@ -5,7 +5,7 @@ source + timestamp, and that optional feeds stay dormant (return []) when unconf
 """
 import asyncio
 
-from okxb.events import coingecko, cryptonews, econ_calendar
+from okxb.events import coingecko, cryptonews, econ_calendar, stocknews
 from okxb.events.provenance import (Evidence, fmt_age, fmt_data_age, fmt_eta,
                                      render_brief, render_schedule, stamp)
 
@@ -115,3 +115,36 @@ def test_coingecko_enabled_label():
     c = coingecko.CoinGeckoClient(api_key="CG-demo")
     assert c.enabled and c.label == "CoinGecko(demo)"
     asyncio.run(c.aclose())
+
+
+# ----------------- stock news RSS (keyless) -----------------
+
+_SAMPLE_RSS = """<?xml version="1.0"?><rss version="2.0"><channel>
+<item><title>Apple hits record high - Reuters</title><link>http://g/abc</link>
+<pubDate>Sat, 20 Jun 2026 12:00:00 GMT</pubDate>
+<source url="http://reuters.com">Reuters</source></item>
+<item><title>AAPL earnings preview</title><link>http://y/def</link>
+<pubDate>Fri, 19 Jun 2026 09:00:00 GMT</pubDate></item>
+<item><link>http://no/title</link></item>
+</channel></rss>"""
+
+
+def test_stocknews_parse_rss_extracts_source_link_time():
+    evs = stocknews._parse_rss(_SAMPLE_RSS, "GoogleNews", NOW, limit=10)
+    assert len(evs) == 2                                  # 第3条无标题被丢弃
+    assert evs[0].source == "Reuters" and evs[0].url == "http://g/abc"
+    assert evs[0].publish_ms is not None
+    assert evs[1].source == "GoogleNews"                 # 无 <source> 用默认
+    bad = stocknews._parse_rss("not xml", "Yahoo", NOW, limit=5)
+    assert bad == []
+
+
+def test_stocknews_disabled_returns_empty():
+    c = stocknews.StockNewsClient(enabled=False)
+    assert not c.enabled
+    assert asyncio.run(c.headlines("AAPL")) == []
+
+
+def test_stocknews_rfc822_parser():
+    assert stocknews._rfc822_ms("Sat, 20 Jun 2026 12:00:00 GMT") is not None
+    assert stocknews._rfc822_ms("nope") is None
