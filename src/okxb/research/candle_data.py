@@ -25,6 +25,8 @@ HOSTS = ["https://www.okx.com", "https://us.okx.com", "https://eea.okx.com"]
 BAR_MS = {
     "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
     "30m": 1_800_000, "1H": 3_600_000, "2H": 7_200_000, "4H": 14_400_000,
+    "6H": 21_600_000, "12H": 43_200_000,
+    "1D": 86_400_000, "1W": 604_800_000,
 }
 _COLS = ["ts", "o", "h", "l", "c", "vol", "volccy", "volquote", "confirm"]
 
@@ -95,24 +97,70 @@ def _cache_file(root: Path, inst_id: str, bar: str) -> Path:
     return root / f"{inst_id}_{bar}.csv"
 
 
+INCR_MAX_GAP_DAYS = 10.0      # 缓存比这更旧 -> 直接全量重拉(增量翻页太多, 且恐有洞)
+INCR_BUFFER_DAYS = 0.15       # 增量多拉一点与缓存重叠, 保证拼接无缝(无空洞)
+
+
 def get_candles(inst_id: str, bar: str, days: float, root: Path, *,
-                force: bool = False, log: Callable[[str], None] = _log) -> pd.DataFrame:
-    """带磁盘缓存的拉取。缓存覆盖请求范围则直接用; 否则重拉并写盘。"""
+                force: bool = False, update: bool = False,
+                log: Callable[[str], None] = _log) -> pd.DataFrame:
+    """带磁盘缓存的拉取。
+      force=True : 全量重拉并覆盖缓存。
+      update=True: 增量更新——保留缓存, 只拉"缓存最新ts之后"的新 bar 拼接(几次调用而非几百次);
+                   缓存回看不足 / 间隔过大(>INCR_MAX_GAP_DAYS)时自动回退全量; 增量拉空则沿用缓存。
+      默认       : 缓存覆盖请求范围则直接用, 否则全量重拉。"""
     root.mkdir(parents=True, exist_ok=True)
     f = _cache_file(root, inst_id, bar)
-    need_start = int(time.time() * 1000) - int(days * 86_400_000)
-    if f.exists() and not force:
+    now_ms = int(time.time() * 1000)
+    need_start = now_ms - int(days * 86_400_000)
+    bar_ms = BAR_MS[bar]
+
+    def _full() -> pd.DataFrame:
+        df = fetch_history(inst_id, bar, days, log=log)
+        if len(df):
+            df.to_csv(f, index=False)
+        return df
+
+    if force:
+        return _full()
+
+    cache = None
+    if f.exists():
         try:
-            df = pd.read_csv(f)
-            if len(df) > 10 and int(df["ts"].iloc[0]) <= need_start + BAR_MS[bar] * 5:
-                return df
-            log(f"  {inst_id} {bar}: 缓存覆盖不足, 重拉")
+            cache = pd.read_csv(f)
+            cache["ts"] = cache["ts"].astype("int64")
         except Exception as e:  # noqa: BLE001
             log(f"  {inst_id} {bar}: 缓存读取失败 ({e}), 重拉")
-    df = fetch_history(inst_id, bar, days, log=log)
-    if len(df):
-        df.to_csv(f, index=False)
-    return df
+            cache = None
+    if cache is None or len(cache) <= 10:
+        return _full()
+
+    cache_start = int(cache["ts"].iloc[0])
+    cache_max = int(cache["ts"].iloc[-1])
+    covers_start = cache_start <= need_start + bar_ms * 5
+
+    if not update:
+        if covers_start:
+            return cache[cache["ts"] >= need_start].reset_index(drop=True)
+        log(f"  {inst_id} {bar}: 缓存覆盖不足, 重拉")
+        return _full()
+
+    # --- update 增量路径 ---
+    gap_ms = now_ms - cache_max
+    if not covers_start or gap_ms > INCR_MAX_GAP_DAYS * 86_400_000:
+        log(f"  {inst_id} {bar}: 缓存回看不足或间隔过大, 回退全量")
+        return _full()
+    if gap_ms < bar_ms:                                 # 已最新(不足一根新bar)
+        return cache[cache["ts"] >= need_start].reset_index(drop=True)
+    new = fetch_history(inst_id, bar, gap_ms / 86_400_000 + INCR_BUFFER_DAYS, log=log)
+    if not len(new):                                    # 网络没取到新 bar -> 沿用缓存, 不破坏
+        log(f"  {inst_id} {bar}: 增量拉取为空, 沿用现有缓存")
+        return cache[cache["ts"] >= need_start].reset_index(drop=True)
+    merged = (pd.concat([cache, new], ignore_index=True)
+              .drop_duplicates("ts").sort_values("ts").reset_index(drop=True))
+    merged = merged[merged["ts"] >= need_start].reset_index(drop=True)
+    merged.to_csv(f, index=False)
+    return merged
 
 
 def fetch_universe(insts: list[str], bar: str, days: float, root: Path, *,
@@ -229,6 +277,69 @@ def fetch_funding_mean(inst_id: str, days: float, *, host: Optional[str] = None,
     """近 `days` 天的【带符号】平均资金费率 (每 8h)。返回 None=取不到。"""
     df = fetch_funding_series(inst_id, days, host=host, log=log)
     return float(df["funding"].mean()) if len(df) else None
+
+
+def parse_oi_rows(rows: list) -> pd.DataFrame:
+    """Parse OKX open-interest-history rows [ts, oi, oiCcy, oiUsd] -> ascending df(ts, oi, oi_usd)."""
+    out = []
+    for r in rows:
+        try:
+            out.append((int(r[0]), float(r[1]), float(r[3]) if len(r) > 3 else float("nan")))
+        except (TypeError, ValueError, IndexError):
+            continue
+    df = pd.DataFrame(sorted(set(out)), columns=["ts", "oi", "oi_usd"])
+    if len(df):
+        df["ts"] = df["ts"].astype("int64")
+    return df
+
+
+def fetch_oi_history(inst_id: str, period: str, days: float, *,
+                     host: Optional[str] = None, log: Callable[[str], None] = _log) -> pd.DataFrame:
+    """Open-interest history for a perp. period in OKX codes (e.g. '1H','1D'). Ascending df(ts, oi, oi_usd).
+
+    Endpoint: /api/v5/rubik/stat/contracts/open-interest-history (rows newest-first
+    [ts, oi(contracts), oiCcy(base), oiUsd]). Pages backward via `after`.
+    """
+    now_ms = int(time.time() * 1000)
+    start = now_ms - int(days * 86_400_000)
+    hosts = [host] if host else list(HOSTS)
+    url_path = "/api/v5/rubik/stat/contracts/open-interest-history"
+    rows: list = []
+    after: Optional[int] = None
+    last_oldest: Optional[int] = None
+    with httpx.Client(timeout=25.0, headers={"User-Agent": "okxb-research/1"}) as cli:
+        for _ in range(200):
+            data = None
+            for _attempt in range(3):                      # retry a page before giving up (transient net)
+                for h in hosts:
+                    try:
+                        params = {"instId": inst_id, "period": period, "limit": "100"}
+                        if after is not None:
+                            params["after"] = str(after)
+                        j = cli.get(h + url_path, params=params).json()
+                        if j.get("code") == "0":
+                            data = j.get("data", [])
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+                if data is not None:
+                    break
+                time.sleep(0.3)
+            if not data:
+                break
+            rows.extend(data)
+            oldest = min(int(x[0]) for x in data)
+            if oldest <= start or len(data) < 2:
+                break
+            # OKX rubik OI-history retains only the recent window and ignores `after`/`before`;
+            # if paging no longer reaches older data, stop instead of re-fetching the same page.
+            if last_oldest is not None and oldest >= last_oldest:
+                break
+            last_oldest = oldest
+            after = oldest
+            time.sleep(0.1)
+    df = parse_oi_rows(rows)
+    return df[df["ts"] >= start].reset_index(drop=True)
 
 
 def perp_to_spot(inst_id: str) -> str:

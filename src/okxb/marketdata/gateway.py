@@ -59,6 +59,7 @@ class MarketDataGateway:
         self._ofi: dict[str, dict] = {}
         self._ofi_from_bbo = "bbo-tbt" in self._channels   # 有bbo-tbt(~10ms)则用它驱动, 否则用books5(~100ms)
         self._last_msg_ms: int = 0
+        self._last_data_ms: dict[str, int] = {}            # 逐标的最近一次"真实行情数据"到达时戳 (H-3)
         self._running = False
         self._ws = None
 
@@ -78,6 +79,13 @@ class MarketDataGateway:
         if not self._last_msg_ms:
             return 10 ** 9
         return int(time.time() * 1000) - self._last_msg_ms
+
+    def symbol_age_ms(self, inst_id: str) -> int:
+        """单标的行情老化 (H-3): 某频道掉线/单标的冻结时, 全局 data_age 可能仍新, 须逐标的判。"""
+        t = self._last_data_ms.get(inst_id)
+        if not t:
+            return 10 ** 9
+        return int(time.time() * 1000) - t
 
     def take_ofi(self, inst_id: str) -> Optional[float]:
         """取走自上次以来【逐事件累计】的 OFI(各次增量已按 L1 深度归一化后求和)并清零; 无新事件返回 None。
@@ -167,14 +175,14 @@ class MarketDataGateway:
                 return
 
     async def _handle(self, raw) -> None:
-        self._last_msg_ms = int(time.time() * 1000)
+        # H-3: 心跳 pong 与订阅/错误回执【不】刷新行情老化时戳, 否则行情冻结时 staleness 闸门形同虚设
         if raw == "pong":
             return
         try:
             msg = json.loads(raw)
         except (ValueError, TypeError):
             return
-        if "event" in msg:                          # 订阅/错误回执
+        if "event" in msg:                          # 订阅/错误回执 (非行情数据)
             if msg.get("event") == "error":
                 print(f"[gateway] 订阅错误: {msg}")
             return
@@ -184,6 +192,9 @@ class MarketDataGateway:
         data = msg.get("data")
         if not channel or not inst_id or inst_id not in self.books or not data:
             return
+        now = int(time.time() * 1000)               # 仅真实行情数据到达才刷新老化时戳
+        self._last_msg_ms = now
+        self._last_data_ms[inst_id] = now
 
         if channel in self._book_channels:
             await self._on_book(inst_id, msg.get("action"), data[0],

@@ -78,12 +78,14 @@ class EngineController:
         from ..app import App
         self._loop = asyncio.get_running_loop()
         self.app = App(dry_run=dry_run, log_fn=self._on_log)
+        set_active_engine(self)        # H-1: 供手动下单路径查询风控状态 (HALTED/CLOSE_ONLY 时阻断开仓)
         self.running = True
         try:
             await self.app.setup()
             await self.app.run()
         finally:
             self.running = False
+            set_active_engine(None)
 
     def _on_log(self, line: str) -> None:
         self.logs.append(line)
@@ -410,8 +412,37 @@ async def _sz_from(rest, spec, amount, unit, ref_px):
     return str(contracts), f" (≈{amount}U)", None
 
 
+# ----------------- H-1: 手动开仓的 RiskEngine 状态闸门 -----------------
+# 此前手动下单/套单/设杠杆完全绕过 RiskEngine; 至少在引擎处于熔断/只平仓态时阻断【开仓/加杠杆】。
+_active_engine = None
+
+
+def set_active_engine(ctrl) -> None:
+    global _active_engine
+    _active_engine = ctrl
+
+
+def _manual_open_guard() -> Optional[str]:
+    """引擎处于 HALTED/CLOSE_ONLY 时返回阻断原因 (供开仓/加杠杆路径前置检查); 否则 None。
+    引擎未运行时不阻断 (纯手动操作由用户自负, 不在本闸门范围)。"""
+    ctrl = _active_engine
+    try:
+        if ctrl is not None and getattr(ctrl, "running", False) and getattr(ctrl, "app", None) is not None:
+            st = getattr(ctrl.app.risk.system_state, "name", "")
+            if st in ("HALTED", "CLOSE_ONLY"):
+                return (f"⛔ 引擎状态={st} (熔断/只平仓), 已阻断手动开仓/加杠杆以维护风控闸门。"
+                        f"如确需操作请先人工确认风险 (clear_halt)。平仓/撤单不受影响。")
+    except Exception:
+        return None
+    return None
+
+
 async def _manual_place(inst_id, side, ord_type, amount, unit, px, reduce_only) -> str:
     from ..exchange.okx_rest import OkxError
+    if not reduce_only:                       # 开/加仓才拦; 平仓(reduce_only)始终放行
+        blocked = _manual_open_guard()
+        if blocked:
+            return blocked
     rest, mode, mgn = _new_trade_rest()
     try:
         spec = await _get_spec(rest, inst_id)
@@ -446,6 +477,9 @@ def manual_bracket_sync(inst_id, side, ord_type, amount, unit, px, tp_px, sl_px)
 async def _manual_bracket(inst_id, side, ord_type, amount, unit, px, tp_px, sl_px) -> str:
     """一键套单: 入场单 + 附带止盈(限价)/止损(市价) OCO。价格自动对齐 tickSz; 校验止盈/止损方向。"""
     from ..exchange.okx_rest import OkxError
+    blocked = _manual_open_guard()            # H-1: 套单是开仓, 熔断/只平仓态阻断
+    if blocked:
+        return blocked
     rest, mode, mgn = _new_trade_rest()
     try:
         spec = await _get_spec(rest, inst_id)
@@ -777,8 +811,9 @@ async def _quant_context(inst_id: str, row: dict) -> dict:
 
     atr = row.get("atr")
     fees = cfg.section("fees")
-    # 往返成本: maker入+taker出+半价差+滑点 (保守按可能吃单估)
-    cost = (float(fees.get("crypto_maker_pct", 0.02)) + float(fees.get("crypto_taker_pct", 0.05))) / 100.0
+    rebate = min(max(float(cfg.get("fees.fee_rebate_frac", 0.0) or 0.0), 0.0), 0.9)
+    # 往返成本: (maker入+taker出)手续费×(1−返点) + 半价差 + 滑点 (后两者不返点)
+    cost = (float(fees.get("crypto_maker_pct", 0.02)) + float(fees.get("crypto_taker_pct", 0.05))) / 100.0 * (1.0 - rebate)
     cost += (float(row.get("spread_bps") or 5.0) / 1e4) * 0.5 + 0.0003
     # 止损必须留出成本以上的空间, 否则一点噪声就被扫出、白交手续费 (cost-aware floor)
     sl_cost_mult = float(cfg.get("signal.sl_min_cost_mult", 2.5))
@@ -794,18 +829,26 @@ async def _quant_context(inst_id: str, row: dict) -> dict:
     d = 1 if long_s >= short_s else -1
     dir_prior = "long" if d > 0 else "short"
     entry_px = mid
+    entry_off = 0.0
     tp_px = sl_px = None
     if mid:
         digits = 6 if mid < 1 else (4 if mid < 100 else 2)
-        tp_raw = mid * (1 + d * tp_pct)
-        sl_raw = mid * (1 - d * sl_pct)
+        # maker(post_only)入场价必须落在【正确一侧】: 做多挂买单须≤中间价, 做空挂卖单须≥中间价。
+        # 否则越过盘口被立即吃成 taker —— 这也是"做空却给出低于现价的入场价、看着不可能成交"的根因。
+        # 偏移取 max(半价差, ~1tick, 2bps), 让单子贴着盘口排队, 等回踩(多)/反抽(空)成交。
+        half_spread = (float(row.get("spread_bps") or 4.0) / 1e4) * 0.5
+        tick_frac = (float(tick) / mid) if tick else 0.0
+        entry_off = max(half_spread, tick_frac, 0.0002)
+        entry_raw = mid * (1 - d * entry_off)            # 多: 低于mid; 空: 高于mid
+        tp_raw = entry_raw * (1 + d * tp_pct)            # 止盈止损以【入场价】为基准, 保持盈亏比一致
+        sl_raw = entry_raw * (1 - d * sl_pct)
         # 对齐 tickSz (拿到规格时), 避免导入后下单报价格精度错
         if tick:
-            entry_px = float(_round_tick(mid, tick) or round(mid, digits))
+            entry_px = float(_round_tick(entry_raw, tick) or round(entry_raw, digits))
             tp_px = float(_round_tick(tp_raw, tick) or round(tp_raw, digits))
             sl_px = float(_round_tick(sl_raw, tick) or round(sl_raw, digits))
         else:
-            entry_px = round(mid, digits)
+            entry_px = round(entry_raw, digits)
             tp_px = round(tp_raw, digits)
             sl_px = round(sl_raw, digits)
     return {
@@ -814,7 +857,7 @@ async def _quant_context(inst_id: str, row: dict) -> dict:
         "trend_dir": row.get("trend_dir"), "flow_dir": row.get("flow_dir"),
         "long": long_s, "short": short_s, "atr": atr, "rvol": row.get("rvol"),
         "dir_prior": dir_prior, "sl_pct": round(sl_pct, 5), "tp_pct": round(tp_pct, 5),
-        "entry_px": entry_px, "tp_px": tp_px, "sl_px": sl_px,
+        "entry_px": entry_px, "tp_px": tp_px, "sl_px": sl_px, "entry_off": round(entry_off, 5),
         "lev_suggest": lv, "lev_max": int(lev_max), "size_usdt": size_usdt,
         "target_risk": target_risk, "cost_pct": round(cost, 5), "valid": valid,
     }
@@ -840,8 +883,10 @@ def stock_symbol_set() -> set:
 
 
 async def _okx_24h() -> dict:
-    """一次取回全市场 24h 行情 (真实权威交易所数据): inst -> {chg%, volU}。无需鉴权。"""
-    from ..exchange.okx_rest import OkxError, OkxRestClient
+    """一次取回全市场 24h 行情 (真实权威交易所数据): inst -> {chg%, volU}。无需鉴权。
+    注意: /market/tickers 是全市场(~500条)大响应, 区域受限网络上比单标的更易 ConnectError;
+    这里【宽松兜底】任何网络/解析异常都返回已拿到的部分, 绝不把整个 AI 选品搞挂(原 bug)。"""
+    from ..exchange.okx_rest import OkxRestClient
     rest = OkxRestClient(Secrets(), Config.load())
     out: dict[str, dict] = {}
     try:
@@ -851,8 +896,8 @@ async def _okx_24h() -> dict:
             chg = (last / op - 1.0) * 100.0 if op > 0 else 0.0
             out[t["instId"]] = {"chg": round(chg, 2),
                                 "volU": float(t.get("volCcy24h", 0) or 0)}
-    except OkxError:
-        pass
+    except Exception as e:        # OkxError + httpx.ConnectError/ReadTimeout 等一律兜底
+        print(f"[pick] 全市场24h行情获取失败({e!r}); 改用引擎实时信号/降级继续")
     finally:
         await rest.aclose()
     return out
@@ -900,6 +945,10 @@ async def _ai_pick(pool, rows) -> dict:
     cands.sort(key=lambda c: c["_opp"], reverse=True)
     pool_cn = {"crypto": "加密永续", "stock": "美股永续", "all": "全部永续"}.get(pool, pool)
     if not cands:
+        if not mkt and not rows:
+            return {"text": f"[{pool_cn}] 无法获取候选: 全市场24h行情拉取失败(网络/区域限制), "
+                            "且引擎未在跑。请①点『控制台』▶启动引擎用实时信号选品, 或②检查网络后重试。",
+                    "picks": []}
         return {"text": f"[{pool_cn}] 暂无实时候选。请先在『控制台』▶启动引擎, 待行情填充后再选品。",
                 "picks": []}
     brief = await _external_brief(pool, cands)        # Finnhub 真实新闻/财报 (有key才有)
@@ -1001,6 +1050,9 @@ async def _manual_close(inst_id) -> str:
 
 async def _manual_set_leverage(inst_id, lever) -> str:
     from ..exchange.okx_rest import OkxError
+    blocked = _manual_open_guard()            # H-1: 熔断/只平仓态不允许加杠杆
+    if blocked:
+        return blocked
     rest, mode, mgn = _new_trade_rest()
     try:
         if not await _get_spec(rest, inst_id):

@@ -55,6 +55,22 @@ def is_stock_perp(inst_id: str) -> bool:
     return inst_id.split("-")[0].upper() in _STOCK_SYMBOLS
 
 
+# C-2 fail-closed 兜底: 即使 config.universe.stock_symbols 缺失/不全 (打包版配置漂移),
+# 这些"明显是美股"的代码也绝不能被当作加密山寨处理 (否则错杠杆/跳过周末门/跳过事件否决)。
+CANONICAL_STOCK_TICKERS = {
+    "SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "META", "GOOGL", "AMZN", "GOOG", "NFLX",
+    "AMD", "INTC", "AVGO", "COIN", "MSTR", "PLTR", "ORCL", "MU", "QCOM", "ARM", "ADBE",
+    "CRM", "SMCI", "UBER", "ABNB", "SHOP", "DIS", "BA", "JPM", "V", "MA", "WMT", "PYPL",
+}
+
+
+def stock_classification_mismatches(inst_ids) -> list[str]:
+    """启动期分类自检: 返回"基础代码明显是美股、却没被 is_stock_perp 识别"的 instId。
+    非空即说明 stock_symbols 配置缺失/不全 (典型为 dist 配置漂移) -> 调用方应 fail-closed。"""
+    return [i for i in inst_ids
+            if i.split("-")[0].upper() in CANONICAL_STOCK_TICKERS and not is_stock_perp(i)]
+
+
 class RiskEngine:
     def __init__(self, config: Config, event_provider: Optional[EventProvider] = None):
         self._cfg = config
@@ -71,6 +87,12 @@ class RiskEngine:
         self.high_vol = False
         self._data_age_ms = 0
         self._halted_permanently = False
+        self._halt_reason = ""
+        self._halt_date = ""
+        self._day_date = self._today()
+        # 权益峰值回撤硬停 (含浮亏): 基于交易所真实权益, 不只是已实现盈亏
+        self._dd_hard_stop_frac = float(acc.get("total_drawdown_hard_stop_pct", 5.0)) / 100.0
+        self._no_auto_recover = bool(acc.get("no_auto_recover_after_killswitch", True))
 
         r = config.section("risk")
         self._ladder = r.get("drawdown_ladder", {})
@@ -97,8 +119,20 @@ class RiskEngine:
         self._events = provider
 
     def set_account(self, equity: float, positions: dict[str, Position]) -> None:
-        self.equity = equity
         self.open_positions = positions
+        self._apply_equity(equity)
+
+    def update_equity(self, equity: float) -> None:
+        """周期性喂入交易所真实权益 (totalEq, 含浮亏): 更新峰值并据此检查回撤硬停。"""
+        self._apply_equity(equity)
+
+    def _apply_equity(self, equity: float) -> None:
+        try:
+            self.equity = float(equity)
+        except (TypeError, ValueError):
+            return
+        self.peak_equity = max(self.peak_equity, self.equity)
+        self._update_system_state()
 
     def set_data_age_ms(self, age: int) -> None:
         self._data_age_ms = age
@@ -120,20 +154,33 @@ class RiskEngine:
 
     def reset_day(self) -> None:
         self.day_pnl = 0.0
+        self._day_date = self._today()
         if not self._halted_permanently:
             self.system_state = SystemState.NORMAL
 
     # ----------------- 状态机 -----------------
+
+    def _trip_permanent_halt(self, reason: str) -> None:
+        self._halted_permanently = True
+        self._halt_reason = reason
+        self._halt_date = self._today()
+        self.system_state = SystemState.HALTED
 
     def _update_system_state(self) -> None:
         if self._halted_permanently:
             self.system_state = SystemState.HALTED
             return
         l = self._ladder
-        # 总回撤硬停 (不可自动恢复)
+        # 权益峰值回撤硬停 (含浮亏; 不可自动恢复) —— 基于真实权益而非仅已实现盈亏
+        if self.peak_equity > 0 and self._dd_hard_stop_frac > 0 \
+                and (self.peak_equity - self.equity) / self.peak_equity >= self._dd_hard_stop_frac:
+            self._trip_permanent_halt(
+                f"权益回撤 {(1 - self.equity / self.peak_equity) * 100:.1f}% "
+                f">= {self._dd_hard_stop_frac * 100:.0f}% (峰值 {self.peak_equity:.0f} -> {self.equity:.0f})")
+            return
+        # 总回撤硬停 (已实现累计; 不可自动恢复)
         if self.total_pnl <= float(l.get("total_killswitch_at", -50)):
-            self._halted_permanently = True
-            self.system_state = SystemState.HALTED
+            self._trip_permanent_halt(f"累计已实现亏损 {self.total_pnl:.1f} <= {l.get('total_killswitch_at', -50)}")
             return
         # 日内停机
         if self.day_pnl <= float(l.get("daily_halt_at", -15)):
@@ -265,3 +312,55 @@ class RiskEngine:
         # 简化: UTC 周六/周日。DST + 美股节假日 + 周五收盘前30min 待细化 (RESEARCH_BRIEF §6)。
         wd = datetime.datetime.now(datetime.timezone.utc).weekday()
         return wd >= 5
+
+    # ----------------- 持久化 (跨重启的熔断/回撤状态) -----------------
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+    def to_state(self) -> dict:
+        """供 StateStore 持久化的最小状态快照。"""
+        return {
+            "halted_permanently": self._halted_permanently,
+            "halt_reason": self._halt_reason,
+            "halt_date": self._halt_date,
+            "peak_equity": self.peak_equity,
+            "equity": self.equity,
+            "total_pnl": self.total_pnl,
+            "day_pnl": self.day_pnl,
+            "day_date": self._day_date,
+            "consecutive_losses": self.consecutive_losses,
+        }
+
+    def load_state(self, st: Optional[dict]) -> None:
+        """启动时从持久化恢复熔断/回撤状态, 使『当日不可恢复』硬停跨进程重启生效。
+        重启不再清零硬停 —— 这是 C-4 修复的核心 (此前纯内存, 重启即绕过)。"""
+        if not st:
+            return
+        self.peak_equity = max(self.peak_equity, float(st.get("peak_equity", self.peak_equity) or 0))
+        self.total_pnl = float(st.get("total_pnl", self.total_pnl) or 0)
+        self.consecutive_losses = int(st.get("consecutive_losses", 0) or 0)
+        today = self._today()
+        self.day_pnl = float(st.get("day_pnl", 0) or 0) if str(st.get("day_date")) == today else 0.0
+        self._day_date = today
+        if bool(st.get("halted_permanently")):
+            same_day = str(st.get("halt_date", "")) == today
+            if self._no_auto_recover or same_day:     # no_auto_recover=true: 隔日也保持, 须人工 clear
+                self._halted_permanently = True
+                self._halt_reason = str(st.get("halt_reason", "持久化熔断"))
+                self._halt_date = str(st.get("halt_date", ""))
+        self._update_system_state()
+
+    def clear_halt(self) -> None:
+        """人工解除永久熔断并重置风控基线 (操作员确认账户已恢复、有意 resume 时调用)。
+        必须同时重置峰值=当前权益、清零累计/日内/连亏 —— 否则原回撤条件仍成立会立即再次熔断。"""
+        self._halted_permanently = False
+        self._halt_reason = ""
+        self._halt_date = ""
+        self.peak_equity = self.equity
+        self.total_pnl = 0.0
+        self.day_pnl = 0.0
+        self.consecutive_losses = 0
+        self._day_date = self._today()
+        self._update_system_state()

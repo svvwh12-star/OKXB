@@ -12,6 +12,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from .. import paths
+from . import multiperiod
 from .controller import TOOLTIPS
 from .controller import (PARAM_DEFS, EngineController, account_brief_sync, ai_analyze_sync,
                          ai_pick_sync, apply_calibration_sync, apply_params, calib_files_info,
@@ -109,11 +110,13 @@ class OKXBApp(ctk.CTk):
         self._tab_calib = self._tabs.add("策略校准")
         self._tab_cred = self._tabs.add("账户与密钥")
         self._tab_log = self._tabs.add("日志")
+        self._tab_multi = self._tabs.add("多周期研究")
         self._build_console_tab()
         self._build_manual_tab()
         self._build_calib_tab()
         self._build_credentials_tab()
         self._build_logs_tab()
+        self._build_multi_tab()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(800, self._refresh)
@@ -798,6 +801,229 @@ class OKXBApp(ctk.CTk):
         self.log_box.insert("end", "引擎日志将显示在此。\n")
         self.log_box.configure(state="disabled")
 
+    # ----------------- 多周期研究 (只读监控 + demo 影子执行验证) -----------------
+
+    def _build_multi_tab(self) -> None:
+        t = self._tab_multi
+        self._multi_asset = "btc"
+        self._multi_auto_asset = "btc"
+        ctk.CTkLabel(t, text="多周期 (A/B/C): 监控 + demo影子 + 按 PASS 门控的实盘自动交易源", font=FONT_B,
+                     anchor="w").pack(fill="x", padx=12, pady=(6, 0))
+        ctk.CTkLabel(t, text="BTC 与 ETH 各有独立预登记候选(山寨仍走控制台毫秒)。亮灯由 forward 状态驱动: "
+                     "🟢PASS=统计上有净edge=可实盘 🟡PENDING=观察中=不可实盘 🔴KILL=已关闭。"
+                     "现状 BTC/ETH 的 A/B/C 全 PENDING ⇒ 实盘自动【不会下任何单】(门控按预期工作)。"
+                     "demo 影子=模拟盘执行验证, 非盈利; 实盘仅对 PASS 候选、且需顶部切『实盘』并确认。",
+                     font=("Microsoft YaHei UI", 11), text_color=GREY, anchor="w",
+                     wraplength=960, justify="left").pack(fill="x", padx=12)
+        asr = ctk.CTkFrame(t, fg_color="transparent"); asr.pack(fill="x", padx=8, pady=(4, 0))
+        ctk.CTkLabel(asr, text="标的:", font=FONT).pack(side="left", padx=(4, 4))
+        self.multi_asset_seg = ctk.CTkSegmentedButton(asr, values=["BTC", "ETH"], font=FONT,
+                                                       command=self._multi_asset_changed)
+        self.multi_asset_seg.set("BTC"); self.multi_asset_seg.pack(side="left")
+        ctk.CTkLabel(asr, text="(切换只改显示/影子/AI对照的标的; 自动交易锁定在开启时所选标的, 防误触)",
+                     font=("Microsoft YaHei UI", 11), text_color=GREY).pack(side="left", padx=8)
+        self.multi_status = ctk.CTkTextbox(t, height=190, font=MONO)
+        self.multi_status.pack(fill="x", padx=8, pady=(6, 2))
+        self.multi_status.configure(state="disabled")
+        br = ctk.CTkFrame(t, fg_color="transparent")
+        br.pack(fill="x", padx=8, pady=2)
+        ctk.CTkButton(br, text="↻ 刷新状态", font=FONT, width=90,
+                      command=self._multi_refresh_now).pack(side="left", padx=4)
+        ctk.CTkButton(br, text="🔬 影子干运行(不下单)", font=FONT_B, width=170, fg_color="#7a5cff",
+                      command=lambda: self._multi_shadow(False)).pack(side="left", padx=4)
+        self.multi_arm_btn = ctk.CTkButton(br, text="🎯 在模拟盘执行(demo)", font=FONT_B, width=170,
+                                           fg_color=AMBER, command=lambda: self._multi_shadow(True))
+        self.multi_arm_btn.pack(side="left", padx=4)
+        ctk.CTkButton(br, text="🤖 AI 解读对照", font=FONT_B, width=130, fg_color="#7a5cff",
+                      command=self._multi_ai_compare).pack(side="left", padx=4)
+        ctk.CTkLabel(br, text="(demo 真下单: 顶部切『虚拟盘』+ 配 demo 密钥)",
+                     font=("Microsoft YaHei UI", 11), text_color=GREY).pack(side="left", padx=6)
+        # --- BTC 多周期"真实交易方向源"(按 PASS 门控的自动循环) ---
+        ar = ctk.CTkFrame(t, fg_color="#241f33"); ar.pack(fill="x", padx=8, pady=(4, 2))
+        self._multi_auto_on = False
+        self.multi_auto_btn = ctk.CTkButton(ar, text="▶ 开启BTC多周期自动(demo)", font=FONT_B, width=220,
+                                            fg_color="#2e7d32", command=self._multi_auto_toggle)
+        self.multi_auto_btn.pack(side="left", padx=4, pady=4)
+        self.multi_auto_live = ctk.CTkCheckBox(ar, text="允许实盘(仅PASS候选)", font=FONT)
+        self.multi_auto_live.pack(side="left", padx=8)
+        self.multi_auto_lbl = ctk.CTkLabel(ar, text="自动: 关 (每15min一轮: 刷新verdict + 按门控下单)",
+                                           font=("Microsoft YaHei UI", 11), text_color=GREY)
+        self.multi_auto_lbl.pack(side="left", padx=6)
+        self.multi_result = ctk.CTkTextbox(t, font=MONO)
+        self.multi_result.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        self.multi_result.insert("end", "点『影子干运行』看 A/B/C 当前会不会触发 tau(纯公共数据, 不下单)。\n")
+        self.multi_result.configure(state="disabled")
+        self._multi_busy = False
+        self._multi_refresh_now()
+
+    def _multi_set_status(self, data: dict) -> None:
+        lines = []
+        if not data.get("ok"):
+            lines.append(data.get("note", "无 forward 状态 (先在 scripts 跑 --mode evaluate)"))
+        else:
+            asof = data["rows"][0].get("asof_utc", "") if data["rows"] else ""
+            lines.append(f"[{str(data.get('asset', 'btc')).upper()}] A/B/C forward 状态 (asof {asof}):")
+            emj = {"PASS": "🟢", "KILL": "🔴"}
+            for r in data["rows"]:
+                v = str(r.get("verdict", "PENDING"))
+                lines.append(f"  {emj.get(v, '🟡')} {r.get('code', '?')} H={r.get('H', '?')}min "
+                             f"n_ts={r.get('n_ts', '-')} net10={r.get('net10_bps', '-')} "
+                             f"net15={r.get('net15_bps', '-')} fwd_ic={r.get('fwd_ic', '-')} -> {v}")
+            if data.get("shadow"):
+                lines.append("影子成交(最近):")
+                for s in data["shadow"][-6:]:
+                    lines.append(f"  {s.get('entry_utc', '')} {s.get('code', '')} {s.get('side', '')} "
+                                 f"{s.get('event', '')} {s.get('exit_reason', '')} "
+                                 f"名义{s.get('notional', '')}U")
+        self.multi_status.configure(state="normal")
+        self.multi_status.delete("1.0", "end")
+        self.multi_status.insert("end", "\n".join(lines) + "\n")
+        self.multi_status.configure(state="disabled")
+
+    def _multi_refresh_now(self) -> None:
+        asset = getattr(self, "_multi_asset", "btc")
+
+        def work():
+            data = multiperiod.forward_status(asset)
+            self.after(0, lambda: self._multi_set_status(data))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _multi_asset_changed(self, value: str) -> None:
+        """切换显示标的(BTC/ETH): 只改显示/影子/AI对照的标的; 不影响正在运行的自动交易(其标的在开启时锁定)。"""
+        self._multi_asset = str(value).lower()
+        if not self._multi_auto_on:                      # 自动未开时, 按钮跟随显示标的
+            self._multi_auto_set_label()
+        self._multi_refresh_now()
+
+    def _maybe_refresh_multi(self) -> None:
+        try:
+            if self._tabs.get() != "多周期研究" or self._tick_count % 12 != 0:
+                return
+        except Exception:
+            return
+        self._multi_refresh_now()
+
+    def _multi_result_set(self, text: str) -> None:
+        self.multi_result.configure(state="normal")
+        self.multi_result.delete("1.0", "end")
+        self.multi_result.insert("end", text + "\n")
+        self.multi_result.configure(state="disabled")
+
+    def _multi_shadow(self, armed: bool) -> None:
+        asset = getattr(self, "_multi_asset", "btc")
+        if armed and not messagebox.askyesno(
+                "确认在模拟盘执行",
+                f"将在【模拟盘(demo)】按 {asset.upper()} 的 A/B/C 信号自动下单(执行真实性验证, 非盈利, 预期亏/打平)。\n"
+                "需顶部已切到『虚拟盘』且配好 demo 密钥。确认?"):
+            return
+        if self._multi_busy:
+            return
+        self._multi_busy = True
+        self.multi_arm_btn.configure(state="disabled")
+        self._multi_result_set(f"... {asset.upper()} 影子运行中 (拉数据 + 冻结模型打分, 约 30-90 秒) ...")
+
+        def work():
+            txt = multiperiod.shadow_run(armed, asset)
+
+            def done():
+                self._multi_result_set(txt)
+                self._multi_busy = False
+                self.multi_arm_btn.configure(state="normal")
+                self._multi_refresh_now()
+            self.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _multi_ai_compare(self) -> None:
+        """把多周期量化结论喂给 AI 做只读对照解读 (AI 被硬约束: PENDING/KILL 不得说成机会)。"""
+        if self._multi_busy:
+            return
+        asset = getattr(self, "_multi_asset", "btc")
+        self._multi_busy = True
+        self.multi_arm_btn.configure(state="disabled")
+        self._multi_result_set(f"... {asset.upper()} AI 解读对照中 (跑一次当前打分 + AI 调用, 约 1-2 分钟) ...")
+
+        def work():
+            txt = multiperiod.ai_compare(asset)
+
+            def done():
+                self._multi_result_set(txt)
+                self._multi_busy = False
+                self.multi_arm_btn.configure(state="normal")
+            self.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- 多周期自动交易源 (按 PASS 门控; 标的在开启时锁定) ----
+    def _multi_auto_set_label(self, running: bool = False, live: bool = False) -> None:
+        if not self._multi_auto_on:
+            a = getattr(self, "_multi_asset", "btc").upper()
+            self.multi_auto_btn.configure(text=f"▶ 开启{a}多周期自动(demo)", fg_color="#2e7d32")
+            self.multi_auto_lbl.configure(
+                text="自动: 关 (每15min一轮: 刷新verdict + 按门控下单)", text_color=GREY)
+            return
+        a = getattr(self, "_multi_auto_asset", "btc").upper()
+        if running:
+            self.multi_auto_lbl.configure(
+                text=f"自动[{a}]: 运行中… ({'实盘·仅PASS' if live else 'demo影子'})", text_color=AMBER)
+        else:
+            self.multi_auto_lbl.configure(
+                text=f"自动[{a}]: 开 ({'实盘·仅PASS候选' if live else 'demo影子'}); 下一轮≤15min",
+                text_color=(RED if live else GREEN))
+
+    def _multi_auto_toggle(self) -> None:
+        if self._multi_auto_on:                          # 关闭
+            self._multi_auto_on = False
+            self._multi_auto_set_label()                 # 复位按钮文案(跟随当前显示标的)
+            return
+        asset = getattr(self, "_multi_asset", "btc")
+        live = bool(self.multi_auto_live.get())
+        if live:                                         # 实盘自动: 必须实盘模式 + 强确认
+            if self._m_mode() != "live":
+                messagebox.showwarning("需实盘模式", "勾选了『允许实盘』, 但当前不是实盘模式。\n"
+                                       "请顶部切到『实盘』并配实盘密钥后再开启 (否则只跑 demo)。")
+                return
+            if not messagebox.askyesno(
+                    "实盘自动交易确认",
+                    f"将开启【实盘·真金】{asset.upper()} 多周期自动交易:\n"
+                    "• 仅对 forward verdict=PASS 的候选下单; 现状 A/B/C 全 PENDING ⇒ 不会下任何单。\n"
+                    "• 一旦某候选转 PASS, 会自动按风险预算(单笔≤权益0.3%)建仓+止盈止损。\n"
+                    "• 每 15 分钟一轮, 期间不再逐单确认。\n确认开启?"):
+                return
+        self._multi_auto_asset = asset                   # 锁定自动交易标的(之后切显示标的不影响它)
+        self._multi_auto_live_locked = live              # H-4: 锁定开启时的实盘决定 (运行中改 checkbox 不再即时升级真金)
+        self._multi_auto_on = True
+        self.multi_auto_btn.configure(text=f"⏸ 关闭{asset.upper()}多周期自动", fg_color=(RED if live else AMBER))
+        self._multi_auto_set_label(live=live)
+        self._multi_auto_tick()
+
+    def _multi_auto_tick(self) -> None:
+        if not self._multi_auto_on:
+            return
+        if not self._multi_busy:
+            # H-4: 用开启时锁定的实盘决定, 不再每轮读 checkbox (防运行中无确认升级真金);
+            # 仍叠加当前模式校验 —— 若期间切离实盘, 只会降级为 demo (安全方向)。
+            live = bool(getattr(self, "_multi_auto_live_locked", False)) and self._m_mode() == "live"
+            asset = getattr(self, "_multi_auto_asset", "btc")
+            self._multi_busy = True
+            self.multi_arm_btn.configure(state="disabled")
+            self._multi_auto_set_label(running=True, live=live)
+            self._multi_result_set(
+                f"... {asset.upper()} 多周期自动一轮运行中 ({'实盘·仅PASS' if live else 'demo'}; "
+                "实盘会先 evaluate 刷新 verdict, 约 1-3 分钟) ...")
+
+            def work():
+                txt = multiperiod.auto_step(live, asset)
+
+                def done():
+                    self._multi_result_set(txt)
+                    self._multi_busy = False
+                    self.multi_arm_btn.configure(state="normal")
+                    self._multi_refresh_now()
+                    self._multi_auto_set_label(live=live)
+                self.after(0, done)
+            threading.Thread(target=work, daemon=True).start()
+        if self._multi_auto_on:                          # 不论本轮是否在忙, 都续约下一轮
+            self.after(15 * 60 * 1000, self._multi_auto_tick)
+
     # ----------------- 手动交易 -----------------
 
     def _build_manual_tab(self) -> None:
@@ -965,8 +1191,10 @@ class OKXBApp(ctk.CTk):
             return messagebox.askyesno("实盘真金确认", f"你正在【实盘】{action}, 会动用真金。确认?")
         return True
 
-    def _m_set(self, text: str) -> None:
+    def _m_set(self, text: str, clear: bool = False) -> None:
         self.m_result.configure(state="normal")
+        if clear:                       # 切换标的 / 新一次 AI 分析时清空, 只显示当前标的的内容
+            self.m_result.delete("1.0", "end")
         self.m_result.insert("end", text + "\n")
         self.m_result.see("end")
         self.m_result.configure(state="disabled")
@@ -1036,7 +1264,7 @@ class OKXBApp(ctk.CTk):
         """点持仓行: 把该标的带入左侧表单并刷新行情/历史。"""
         self.m_inst.delete(0, "end"); self.m_inst.insert(0, inst)
         self._refresh_orders()
-        self._m_set(f"已带入 {inst}: 可在左侧改杠杆/数量后『减仓/平该标的』, 或『挂止盈/止损』。")
+        self._m_set(f"已带入 {inst}: 可在左侧改杠杆/数量后『减仓/平该标的』, 或『挂止盈/止损』。", clear=True)
 
     def _m_bracket(self) -> None:
         if not self._m_confirm("套单(建仓+止盈+止损)"):
@@ -1063,13 +1291,13 @@ class OKXBApp(ctk.CTk):
             self._m_set("请先填标的。")
             return
         row = dict(self.ctrl.rows().get(inst, {}))
-        self._m_set(f"... AI 量化分析 {inst} 中 (用更强模型, 约数秒) ...")
+        self._m_set(f"... AI 量化分析 {inst} 中 (用更强模型, 约数秒) ...", clear=True)
 
         def work():
             res = ai_analyze_sync(inst, row)
 
             def done():
-                self._m_set(res.get("text", "(无输出)"))
+                self._m_set(res.get("text", "(无输出)"), clear=True)   # 只显示当前标的研判
                 self._ai_last = res.get("struct")
                 if self._ai_last:
                     self._ai_last.setdefault("inst", inst)
@@ -1115,7 +1343,7 @@ class OKXBApp(ctk.CTk):
         if d.get("mid"):
             self.m_px.delete(0, "end"); self.m_px.insert(0, str(d["mid"]))
         self._tabs.set("手动交易")
-        self._m_set(f"已带入 {inst} (方向按当前信号预选, 可改)。可点『AI分析』或直接『建仓/加仓』。")
+        self._m_set(f"已带入 {inst} (方向按当前信号预选, 可改)。可点『AI分析』或直接『建仓/加仓』。", clear=True)
 
     # ---- 实时面板: 行情 + 持仓 + 挂单 + 止盈止损 + 历史成交 ----
     def _refresh_orders(self) -> None:
@@ -1393,6 +1621,7 @@ class OKXBApp(ctk.CTk):
         for line in self.ctrl.drain_logs():
             self._append_log(line)
         self._maybe_autorefresh_orders()
+        self._maybe_refresh_multi()
 
         running = self.ctrl.running
         # 确定性按运行态设置按钮 (修复"停止点不动": 之前竞态会在启动后误禁用停止)

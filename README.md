@@ -1,5 +1,9 @@
 # OKXB — OKX 股票永续 + 加密永续 自动量化交易系统
 
+[![CI](https://github.com/svvwh12-star/OKXB/actions/workflows/ci.yml/badge.svg)](https://github.com/svvwh12-star/OKXB/actions/workflows/ci.yml)
+
+> CI 徽章追踪**默认分支**最近一次 `pytest` 运行 (绿=全过/红=有失败); 点击徽章看详情。
+
 个人自用的、**高频扫描 / 低频触发 / 强风控**的自动量化交易系统。
 定位不是拼速度，而是 **只在高流动性、低成本、多因子共振、可控亏损** 的窗口里出手。
 

@@ -202,12 +202,16 @@ class LLMClassifier:
             return _parse_json(txt)
         url = f"{self.base_url}/chat/completions"
         body = {"model": model, "max_tokens": max_tokens, "temperature": 0.2, "stream": False,
-                "response_format": {"type": "json_object"},
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": user}]}
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=40.0) as c:
-            r = await c.post(url, headers=headers, json=body)
+            # 先试 json_object 模式; 若该模型/端点不支持(常见 400), 去掉 response_format 重试
+            # (prompt 已明确要求 JSON, _parse_json 有稳健兜底)。这修"ping通但JSON调用挂"的症状。
+            r = await c.post(url, headers=headers, json={**body, "response_format": {"type": "json_object"}})
+            if r.status_code >= 400:
+                print(f"[llm] json_object 被拒({r.status_code}), 降级为普通+解析重试: {r.text[:160]}")
+                r = await c.post(url, headers=headers, json=body)
             if r.status_code >= 400:        # 带出服务端真实原因, 否则只看到裸 400 无从排查
                 raise RuntimeError(f"{self.provider} {r.status_code} @ chat/completions: {r.text[:400]}")
             msg = r.json()["choices"][0]["message"]
@@ -232,7 +236,12 @@ class LLMClassifier:
         sysp = ("你是严谨的加密/美股永续合约短线量化分析师。只允许基于【给定的客观盘口与因子数据】"
                 "与【已算好的风险量】做判断, 严禁编造新闻、财报、社媒或任何外部消息。"
                 "杠杆必须在 [3, {lvmax}] 内且优先采用给定的『量化建议杠杆』, 仅在有明确理由时小幅调整。"
-                "止盈/止损/入场价应贴近给定的量化默认值。务必中文。"
+                "止盈/止损/入场价应贴近给定的量化默认值。"
+                "【铁律·挂单侧】若 order_type=post_only(挂单/maker), entry_px 必须落在 maker 侧: "
+                "做多(long)时 entry_px ≤ 中间价, 做空(short)时 entry_px ≥ 中间价; "
+                "否则会越过盘口被立即成交为 taker(做空给出低于现价的入场价是错误的)。"
+                "entry_px 偏离中间价不要超过 0.3%。若你想立即成交, 请把 order_type 改为 optimal_limit_ioc 并说明。"
+                "务必中文。"
                 ).format(lvmax=int(qctx.get("lev_max", 50)))
         schema = ('{"direction":"long|short|flat","order_type":"post_only|limit|optimal_limit_ioc",'
                   '"entry_px":number,"tp_px":number,"sl_px":number,"leverage":int,'
@@ -287,6 +296,21 @@ class LLMClassifier:
         for k in ("rationale", "risks", "scaling"):
             if isinstance(d.get(k), str):
                 out[k] = d[k][:200]
+        # 安全网: 强制 maker 侧。post_only 下若 AI 把入场价放错一侧(做空给≤现价、做多给≥现价),
+        # 就按所选方向用 mid+客观偏移重算 入场/止盈/止损, 保证逻辑上能挂单成交、盈亏比不变。
+        mid = qctx.get("mid")
+        dsign = 1 if out["direction"] == "long" else (-1 if out["direction"] == "short" else 0)
+        if mid and dsign and out["order_type"] == "post_only":
+            ep = out.get("entry_px")
+            wrong = ep is None or (dsign > 0 and ep > mid) or (dsign < 0 and ep < mid)
+            if wrong:
+                off = float(qctx.get("entry_off") or 0.0002)
+                sl_pct = float(qctx.get("sl_pct") or 0.0)
+                tp_pct = float(qctx.get("tp_pct") or 0.0)
+                entry = mid * (1 - dsign * off)
+                out["entry_px"] = round(entry, 6)
+                out["tp_px"] = round(entry * (1 + dsign * tp_pct), 6)
+                out["sl_px"] = round(entry * (1 - dsign * sl_pct), 6)
         return out
 
     async def pick_products(self, pool_label: str, candidates: list[dict],
@@ -324,10 +348,17 @@ class LLMClassifier:
         try:
             d = await self._chat_json(self._json_model(), sysp, user, max_tokens=1600)
             picks = d.get("picks") if isinstance(d.get("picks"), list) else []
+            valid_insts = {str(c.get("inst")) for c in candidates}   # 只认真实候选池
             clean = []
-            for p in picks[:5]:
+            dropped = []
+            for p in picks[:8]:
                 if not isinstance(p, dict) or not p.get("inst"):
                     continue
+                if str(p["inst"]) not in valid_insts:    # 拦截 AI 杜撰/写错的标的(如 BEAT-USDT-SWAP)
+                    dropped.append(str(p["inst"]))
+                    continue
+                if len(clean) >= 5:
+                    break
                 try:
                     lv = max(3, min(50, int(round(float(p.get("leverage", 5))))))
                 except (TypeError, ValueError):
@@ -341,9 +372,61 @@ class LLMClassifier:
                     "reason": str(p.get("reason", ""))[:120],
                     "risk": str(p.get("risk", ""))[:100],
                 })
-            return {"ok": True, "picks": clean, "text": _render_picks(pool_label, clean, d.get("note", ""))}
+            note = str(d.get("note", ""))
+            if dropped:      # 把被拦截的杜撰标的如实告知, 不静默丢弃
+                note = (note + f" (已忽略不在候选池中的杜撰标的: {', '.join(dropped[:5])})").strip()
+            return {"ok": True, "picks": clean, "text": _render_picks(pool_label, clean, note)}
         except Exception as e:
             return {"ok": False, "picks": [], "text": f"AI 选品失败: {e!r}"}
+
+    async def explain_quant_monitor(self, quant_text: str) -> str:
+        """对【多周期量化研究监控】结论做只读解读 + 标『AI vs 量化』差异。
+        铁律(写进 system): 这是只读研究监控; 除非 forward 状态=PASS, 否则候选一律不可交易;
+        绝不能把 PENDING/KILL 说成'有机会/可尝试/可入场'。不给交易建议, 只做对照解读。"""
+        if not self.enabled:
+            return ("未配置 AI (当前=规则或未填 key)。请到『账户与密钥』选 DeepSeek 填 Key 后再用。")
+        sysp = ("你是严谨的量化研究助理, 对一份『多周期量化研究监控』结论做解读。"
+                "【铁律】这是只读研究监控, 不是交易信号: 任何候选除非其 forward 状态=PASS, "
+                "否则一律【不可交易】; 你【绝对不得】把 PENDING 或 KILL 的候选描述成"
+                "'有机会/可以尝试/可入场/值得关注买卖'之类。你的唯一任务是解读与对照, 不给任何交易建议。"
+                "请输出三段, 每段加方括号小标题: "
+                "【量化客观结论】用一两句复述给定数据说明了什么(方向打分是否达 tau、forward 是否过门); "
+                "【AI 互补解读】给市场情境/波动regime/事件日历视角(不要重复方向预测, 给量化没覆盖的角度); "
+                "【AI vs 量化 差异】明确指出你的看法与量化测量哪里一致、哪里不同, 以及为何仍不可交易。"
+                "务必中文, 总字数<=320。")
+        user = (f"多周期量化结论(BTC 单品种, A/B/C 三个预登记候选):\n{quant_text}\n\n"
+                "请按上述三段输出。记住: 全 PENDING = 研究观察期, 不可交易; 不得给交易建议。")
+        try:
+            txt = await self._chat(self.model_hard, sysp, user, max_tokens=800)
+            return txt.strip() or "AI 未返回内容。"
+        except Exception as e:
+            return f"AI 解读失败: {e!r}"
+
+    async def analyze_market(self, objective_text: str) -> str:
+        """对一份【客观市场数据快照】做系统、严谨、客观的【独立】分析(盲: 不给任何模型打分/结论)。
+        用于'AI 叙述 vs 量化测量'对照: AI 独立给方向/逐因子/置信/风险, 由程序另行并排量化结论。
+        铁律: 只基于给定数据, 不得编造数据外的新闻/事件/价格; 这是研究对照, 不是交易指令。"""
+        if not self.enabled:
+            return "未配置 AI (当前=规则或未填 key)。请到『账户与密钥』选 DeepSeek 填 Key 后再用。"
+        sysp = (
+            "你是资深的加密货币永续合约【中短线(数小时到数日)】量化分析师。"
+            "基于下面给定的【客观市场数据快照】做系统、严谨、客观的【独立】分析(这是研究对照, 不是交易指令)。\n"
+            "要求, 务必分点:\n"
+            "1) 逐维度评估, 每条标明该维度倾向(偏多/偏空/中性)及理由: "
+            "①价格趋势与近端动量; ②波动率regime(已实现RV与隐含DVOL的高低及其差/VRP的含义); "
+            "③衍生品结构(资金费率正负与量级、OI周转变化、永续-现货基差); "
+            "④持仓情绪(多空账户比); ⑤链上(交易所净流入、MVRV、活跃地址)若给出。\n"
+            "2) 综合方向倾向(做多/做空/观望)+置信度(低/中/高), 说明主要依据与彼此矛盾之处。\n"
+            "3) 关键风险与不确定性: 明确指出数据不足以支撑高把握的地方。\n"
+            "铁律: 严禁编造任何数据之外的新闻/财报/社媒/价格; 只能基于给定数据推断; "
+            "明确区分'数据直接支持'与'经验性推测'。务必中文, 分点, 总字数<=380。")
+        user = (f"客观市场数据快照(BTC-USDT 永续, 多周期中短线视角):\n{objective_text}\n\n"
+                "请按上述三点给出你的独立专业分析。")
+        try:
+            txt = await self._chat(self.model_hard, sysp, user, max_tokens=1000)
+            return txt.strip() or "AI 未返回内容。"
+        except Exception as e:
+            return f"AI 分析失败: {e!r}"
 
     # ----------------- OpenAI 兼容 (DeepSeek 等) -----------------
 
@@ -447,9 +530,12 @@ _OT_CN = {"post_only": "只挂单(maker)", "limit": "限价", "optimal_limit_ioc
 
 def _render_analysis(inst: str, s: dict, qctx: dict) -> str:
     d = s.get("direction", "flat")
+    mid = qctx.get("mid")
+    side_cn = "高于现价挂卖(等反抽)" if d == "short" else ("低于现价挂买(等回踩)" if d == "long" else "")
+    mid_cn = f" [现价≈{mid}{('; ' + side_cn) if side_cn else ''}]" if mid else ""
     lines = [f"【{inst}】AI 量化研判  (置信度 {s.get('confidence', 0):.0%})",
              f"方向: {_DIR_CN.get(d, d)}    下单类型: {_OT_CN.get(s.get('order_type'), s.get('order_type'))}",
-             f"入场价≈{s.get('entry_px')}   止盈≈{s.get('tp_px')}   止损≈{s.get('sl_px')}",
+             f"入场价≈{s.get('entry_px')}   止盈≈{s.get('tp_px')}   止损≈{s.get('sl_px')}{mid_cn}",
              f"建议杠杆: {s.get('leverage')}x (逐仓; 依据 ATR 推导的止损距离, "
              f"使止损亏损≈保证金的{int(qctx.get('target_risk', 0.1)*100)}%, 上限{qctx.get('lev_max')}x)",
              f"建议下单额: {s.get('size_usdt')} USDT (按单笔风险预算)",
@@ -457,6 +543,7 @@ def _render_analysis(inst: str, s: dict, qctx: dict) -> str:
              f"风险: {s.get('risks') or '-'}",
              f"建/减仓: {s.get('scaling') or '-'}",
              "—— 点『⬇ 导入手动交易』把以上参数填入下单区(不会自动下单, 你确认后再点下单)。",
+             "注: 入场价是【挂单(maker)参考】, 真正下单时会按当时盘口校正到正确一侧; 价已过期则被重排。",
              "仅供参考, 非投资建议。"]
     return "\n".join(lines)
 

@@ -1,0 +1,41 @@
+name: CI
+
+# 在每次 push 与对 main 的 PR 上跑 pytest。
+# 目的: 碰钱路径(风控/执行/sizing/订单簿/信号)与研究有效性(防泄漏/防过拟合)的回归测试
+# 自动把关 —— 这正是审计 NEW-1 (审批单字段名 bug 静默失效) 的教训: 没有 CI 时这类回归无人发现。
+on:
+  push:
+  pull_request:
+    branches: [main, master]      # 本仓库基线分支是 master; 两者都覆盖
+
+concurrency:                      # 同一分支新 push 取消进行中的旧运行, 省额度
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        env:
+          PYTHONPATH: src          # conftest.py 已加 src, 这里双保险
+        run: pytest -q --maxfail=1

@@ -63,6 +63,9 @@ class Executor:
         self._trail_arm = float(sg.get("trail_arm_pct", 0.0015))
         self._trail_frac = float(sg.get("trail_dist_frac_of_sl", 0.5))
         self._exit_cost_mult = float(sg.get("exit_cost_mult", 1.0))
+        # C-5: 开仓即在交易所端挂 reduce-only 止损 algo, 崩溃/断线/死手开关后仍生效
+        self._exch_stop = bool(config.get("execution.exchange_resident_stop", True))
+        self._exch_stop_market = bool(config.get("execution.exchange_resident_stop_market", True))
 
     def _ps(self, pos_dir: Side) -> str:
         """持仓方向 -> posSide。单向=net; 双向: 多=long 空=short。"""
@@ -200,6 +203,21 @@ class Executor:
             pos.tp_order_oid = tp.get("ordId")
         except OkxError as e:
             await self._store.audit("tp_reject", f"{inst} {e}")
+        # C-5: 交易所端 reduce-only 止损 (algo 不被 cancel-all-after 死手开关撤掉, 崩溃后仍护盘)。
+        # 失败不阻断建仓: 退回本地 monitor_positions 止损 (但崩溃即裸仓), 故大声告警。
+        if self._exch_stop:
+            try:
+                algo = await self._rest.place_algo_order(
+                    inst_id=inst, td_mode=self._td_mode, side=exit_side.value,
+                    sz=str(contracts), pos_side=self._ps(sig.side), reduce_only=self._exit_reduce,
+                    sl_trigger_px=str(sl_px),
+                    sl_ord_px=("-1" if self._exch_stop_market else str(sl_px)),
+                    trigger_px_type="last",
+                )
+                pos.sl_algo_oid = algo.get("algoId")
+            except OkxError as e:
+                await self._store.audit("sl_algo_reject", f"{inst} {e}")
+                self._alert(f"⚠ {inst} 交易所端止损挂单失败({e}); 仅剩本地止损, 进程崩溃将裸仓")
         self._om.add_position(pos)
         await self._store.audit("opened", f"{inst} {sig.side.value} {contracts}@{entry_px} "
                                           f"SL={sl_px} TP={tp_px}")
@@ -272,6 +290,12 @@ class Executor:
                     await self._rest.cancel_order(pos.inst_id, ord_id=pos.tp_order_oid)
                 except OkxError:
                     pass
+            # 撤交易所端止损 algo (否则平仓后残留一张 reduce-only 委托)
+            if pos.sl_algo_oid:
+                try:
+                    await self._rest.cancel_algos([{"algoId": pos.sl_algo_oid, "instId": pos.inst_id}])
+                except OkxError:
+                    pass
             try:
                 await self._rest.place_order(
                     inst_id=pos.inst_id, td_mode=self._td_mode, side=exit_side.value,
@@ -286,6 +310,10 @@ class Executor:
         pnl = float((mid - pos.entry_px) * sign * pos.contracts
                     * Decimal(str(self._inst.ct_val(pos.inst_id))))
         self._risk.register_close(pnl)
+        try:                                   # C-4: 平仓即落盘风控状态, 崩溃也不丢硬停账目
+            await self._store.set_kv("risk_state", self._risk.to_state())
+        except Exception:                      # noqa: BLE001 持久化失败不得影响平仓主流程
+            pass
         await self._store.record_pnl(pos.inst_id, pos.strategy.value, pnl, {"reason": reason})
         await self._store.audit("closed", f"{pos.inst_id} {reason} pnl~{pnl:.3f}")
         self._om.remove_position(pos.inst_id)

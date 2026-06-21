@@ -23,6 +23,10 @@ scipy>=1.12.0
 scikit-learn>=1.4.0
 lightgbm>=4.3.0
 
+# --- v2 正交数据源 (免费) ---
+coinmetrics-api-client>=2024.1.0   # community (no-key) daily on-chain metrics
+pandas-datareader>=0.10.0          # macro via stooq (VIX / indices / yields)
+
 # --- 数据结构 ---
 sortedcontainers>=2.4.0    # 本地订单簿有序价位
 
