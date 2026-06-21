@@ -50,3 +50,6 @@ btc_single_asset_research/frozen/
 btc_single_asset_research/forward/
 btc_single_asset_research/raw_l2/
 btc_single_asset_research/reports/
+
+# codexOKXB: 独立 git 仓库 (有自己的 .git), 主仓库不跟踪它
+codexOKXB/
