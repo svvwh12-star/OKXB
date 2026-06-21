@@ -22,6 +22,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -40,6 +41,7 @@ from okxb.research import candle_data as cd              # noqa: E402
 from okxb.research import candle_research as cr          # noqa: E402
 from okxb.research import feature_lab as fl              # noqa: E402
 from okxb.research import pro_model_workflow as pmw      # noqa: E402
+from okxb.research import forward_integrity as fi        # noqa: E402  (RV-1/2/3 完整性工具)
 from okxb.config import Config, Secrets                  # noqa: E402
 from okxb.core.enums import Mode                         # noqa: E402
 from sklearn.preprocessing import StandardScaler         # noqa: E402
@@ -116,7 +118,11 @@ K_SEL = 30
 PRESET = "deep"
 TAKER_BPS = 10.0
 STRESS_MULT = 1.5            # protocol: net judged after cost x1.5  -> taker 10 -> 15 bps
-T_PASS = 2.13               # Bonferroni for 3 candidates (alpha=0.05)
+# RV-3 多重检验: 当前并行前向测试的真实候选总数 (btc A/B/C + eth A/B/C + stock ST720 = 7)。
+# 新增任何候选都必须同步此数, 否则族级假阳率被系统性低估。Bonferroni 阈值随之收紧。
+N_PARALLEL_CANDIDATES = 7
+bonferroni_t = fi.bonferroni_t
+T_PASS = bonferroni_t(N_PARALLEL_CANDIDATES)   # 7 候选 -> ~2.46 (此前硬编码 2.13 仅校正了 3 个)
 N_MIN = 50
 N_KILL = 30
 WEEK_MS = 7 * 86_400_000
@@ -167,6 +173,33 @@ def build_panel(H: int, *, days: int, source: str, force: bool, apply_funding: b
     return _panel_from_raw(raw, H, apply_funding=apply_funding)
 
 
+# ----------------- RV-1/RV-2 预登记完整性 (复用 okxb.research.forward_integrity) -----------------
+
+_write_manifest = fi.write_manifest
+_verify_manifest = fi.verify_manifest
+
+
+def _dead_path(code: str) -> Path:
+    return fi.dead_path(FROZEN, code)
+
+
+def _read_dead(code: str) -> Optional[dict]:
+    return fi.read_dead(FROZEN, code)
+
+
+def _write_dead(code: str, reason: str, stats: dict) -> None:
+    fi.write_dead(FROZEN, code, reason, stats)
+
+
+def _count_frozen_candidates() -> int:
+    """跨所有族 (btc A/B/C + eth + stock) 统计已冻结候选数, 用于核对 N_PARALLEL_CANDIDATES 是否够大。"""
+    n = 0
+    for base in (OUT / "frozen", ROOT / "stock_calendar_research" / "frozen"):
+        if base.exists():
+            n += sum(1 for _ in base.rglob("meta.json"))
+    return n
+
+
 def freeze() -> None:
     FROZEN.mkdir(parents=True, exist_ok=True)
     stamp = int(time.time() * 1000)
@@ -201,6 +234,8 @@ def freeze() -> None:
             "official_forward_start_ts": stamp,
             "apply_funding_train": bool(H >= 240),
         }, indent=2), encoding="utf-8")
+        _write_manifest(d)                              # RV-1: 工件内容哈希清单 (证明此后未改)
+        _dead_path(code).unlink(missing_ok=True)        # 重新冻结=全新登记, 清除旧的 KILL 死标
         log(f"[freeze {code}] H={H} {model_name} sel={len(sel)} tau={tau:.5f} "
             f"oos_ic_sign={ic_sign:+d} (in-sample {insample_ic_sign:+d}) cutoff={enh.ts_utc(int(data['ts'].max()))}")
 
@@ -211,14 +246,16 @@ def _net(port: np.ndarray, cost_bps: float):
 
 
 def forward_verdict(net15: float, t15: float, net10: float, n_ts: int,
-                    fwd_ic_sign: int, train_ic_sign: int, weeks: float) -> str:
-    """Pure PASS/KILL logic per protocol section 4/5."""
+                    fwd_ic_sign: int, train_ic_sign: int, weeks: float,
+                    t_pass: Optional[float] = None) -> str:
+    """Pure PASS/KILL logic per protocol section 4/5. t_pass 默认用族级 Bonferroni 阈值 T_PASS。"""
+    tp = T_PASS if t_pass is None else t_pass
     if n_ts >= 8:
         if (net10 is not None and net10 <= 0) or (fwd_ic_sign != 0 and fwd_ic_sign != train_ic_sign):
             return "KILL"
     if weeks >= 6 and n_ts < N_KILL:
         return "KILL"
-    if (net15 is not None and net15 > 0 and (t15 or 0) > T_PASS and n_ts >= N_MIN
+    if (net15 is not None and net15 > 0 and (t15 or 0) > tp and n_ts >= N_MIN
             and fwd_ic_sign == train_ic_sign):
         return "PASS"
     return "PENDING"
@@ -240,6 +277,12 @@ def evaluate() -> None:
     if not frozen:
         log("no frozen candidates — run --mode freeze first")
         return
+    # RV-3: 用真实并行候选数做多重检验校正; 若磁盘上冻结的候选已超过申报数, 大声告警 (阈值偏松)
+    on_disk = _count_frozen_candidates()
+    log(f"[evaluate {ASSET}] 多重检验: T_PASS={T_PASS:.3f} (Bonferroni N={N_PARALLEL_CANDIDATES}; "
+        f"磁盘上冻结候选共 {on_disk} 个)")
+    if on_disk > N_PARALLEL_CANDIDATES:
+        log(f"⚠ 冻结候选 {on_disk} > 申报 {N_PARALLEL_CANDIDATES}: 多重检验被低估, 请上调 N_PARALLEL_CANDIDATES!")
     days_max = max(150 + int((now_ms - m["freeze_cutoff_ts"]) / 86_400_000) + 10 for _, _, m in frozen)
     log(f"[evaluate {ASSET}] 增量拉取(只取新bar)+日缓存外部源, days={days_max}, {len(frozen)} 个周期复用")
     raw = _fetch_raw(days_max, source="refresh", force=False, update=True)
@@ -252,6 +295,21 @@ def evaluate() -> None:
 
     rows = []
     for code, d, meta in frozen:
+        weeks0 = round((now_ms - meta["frozen_at_ms"]) / WEEK_MS, 2)
+        # RV-1: 冻结后被改动 -> 排除 (预登记失效, 不可再当作有效前向测试)
+        tamper = _verify_manifest(d)
+        if tamper and tamper != "no-manifest":
+            log(f"[{code}] ⚠ 预登记完整性失败: {tamper} -> EXCLUDED")
+            rows.append({"code": code, "H": meta.get("H"), "weeks_since_freeze": weeks0,
+                         "n_signals": 0, "n_ts": 0, "verdict": "EXCLUDED", "start_utc": ""})
+            continue
+        # RV-2: KILL 粘性 -> 已判死的候选直接跳过, 永不复活成 PENDING/PASS
+        dead = _read_dead(code)
+        if dead:
+            log(f"[{code}] 已判死(sticky, 不复活): {dead.get('reason')}")
+            rows.append({"code": code, "H": meta.get("H"), "weeks_since_freeze": weeks0,
+                         "n_signals": 0, "n_ts": 0, "verdict": "DEAD", "start_utc": ""})
+            continue
         H, bar_ms, tau = meta["H"], meta["bar_ms"], meta["tau"]
         cutoff, train_ic_sign = meta["freeze_cutoff_ts"], meta["ic_sign"]
         official_start = max(int(cutoff), int(meta.get("official_forward_start_ts", meta["frozen_at_ms"])))
@@ -288,6 +346,10 @@ def evaluate() -> None:
                 fic = cr._spearman(tr["score"].values, tr["fwd"].values) if len(tr) > 5 else 0.0
                 fic_sign = int(np.sign(fic or 0.0))
                 verdict = forward_verdict(net15, t15, net10, len(port), fic_sign, train_ic_sign, weeks)
+                if verdict == "KILL":               # RV-2: 落盘死标, 此后不再复活
+                    _write_dead(code, f"forward KILL: net10={net10:.1f} fwd_ic_sign={fic_sign} "
+                                f"vs train={train_ic_sign} n_ts={len(port)} weeks={weeks:.1f}",
+                                {"net10_bps": round(net10, 1), "n_ts": int(len(port)), "weeks": round(weeks, 1)})
                 row.update({"n_signals": len(tr), "n_ts": len(port),
                             "net10_bps": round(net10, 1), "t10": round(t10, 2),
                             "net15_bps": round(net15, 1), "t15": round(t15, 2),
@@ -550,12 +612,31 @@ def snapshot() -> None:
 
 
 def selftest() -> None:
-    assert forward_verdict(5.0, 2.5, 6.0, 60, 1, 1, 2.0) == "PASS"
-    assert forward_verdict(5.0, 2.5, 6.0, 40, 1, 1, 2.0) == "PENDING"   # n<50
-    assert forward_verdict(5.0, 1.8, 6.0, 60, 1, 1, 2.0) == "PENDING"   # t<2.13
-    assert forward_verdict(5.0, 2.5, -1.0, 60, 1, 1, 2.0) == "KILL"     # net10<=0
-    assert forward_verdict(5.0, 2.5, 6.0, 60, -1, 1, 2.0) == "KILL"     # IC flipped
-    assert forward_verdict(5.0, 2.5, 6.0, 20, 1, 1, 6.5) == "KILL"      # 6wk and n<30
+    # 显式 t_pass=2.13 保持这些断言稳定 (不随族大小变化); evaluate() 实际用族级 T_PASS。
+    assert forward_verdict(5.0, 2.5, 6.0, 60, 1, 1, 2.0, t_pass=2.13) == "PASS"
+    assert forward_verdict(5.0, 2.5, 6.0, 40, 1, 1, 2.0, t_pass=2.13) == "PENDING"   # n<50
+    assert forward_verdict(5.0, 1.8, 6.0, 60, 1, 1, 2.0, t_pass=2.13) == "PENDING"   # t<2.13
+    assert forward_verdict(5.0, 2.5, -1.0, 60, 1, 1, 2.0, t_pass=2.13) == "KILL"     # net10<=0
+    assert forward_verdict(5.0, 2.5, 6.0, 60, -1, 1, 2.0, t_pass=2.13) == "KILL"     # IC flipped
+    assert forward_verdict(5.0, 2.5, 6.0, 20, 1, 1, 6.5, t_pass=2.13) == "KILL"      # 6wk and n<30
+    # RV-3: Bonferroni 阈值随候选数单调收紧; 默认 T_PASS 已按真实族 (>=7) 校正, 比旧的 2.13 更严
+    assert bonferroni_t(3) < bonferroni_t(7) < bonferroni_t(20)
+    assert abs(bonferroni_t(3) - 2.128) < 0.03
+    assert T_PASS >= bonferroni_t(7) - 1e-9 and T_PASS > 2.13
+    # RV-1: manifest 内容哈希能检出冻结后改动
+    import shutil as _sh
+    import tempfile as _tf
+    _td = Path(_tf.mkdtemp())
+    try:
+        (_td / "model.pkl").write_bytes(b"frozen-bytes")
+        (_td / "meta.json").write_text("{}", encoding="utf-8")
+        _write_manifest(_td)
+        assert _verify_manifest(_td) is None
+        (_td / "meta.json").write_text('{"tampered": 1}', encoding="utf-8")
+        assert _verify_manifest(_td) not in (None, "no-manifest")        # 检出篡改
+    finally:
+        _sh.rmtree(_td, ignore_errors=True)
+    assert _read_dead("__nonexistent_code__") is None                    # RV-2: 无死标返回 None
     n, lv = shadow_size(1000.0, 0.003, 0.01, 60000.0)                  # max_loss=3 -> notional 300, lever clamps to 1
     assert abs(n - 300.0) < 1e-6 and lv == 1.0
     n2, lv2 = shadow_size(1000.0, 0.003, 0.001, 60000.0)               # tighter SL -> notional 3000, lever 3

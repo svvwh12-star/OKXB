@@ -27,6 +27,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -44,6 +45,7 @@ from okxb.research import candle_data as cd           # noqa: E402
 from okxb.research import candle_research as cr        # noqa: E402
 from okxb.research import feature_lab as fl            # noqa: E402
 from okxb.research import pro_model_workflow as pmw    # noqa: E402
+from okxb.research import forward_integrity as fi      # noqa: E402  (RV-1/2/3 完整性工具)
 from sklearn.preprocessing import StandardScaler       # noqa: E402
 
 OUT = ROOT / "stock_calendar_research"
@@ -70,7 +72,13 @@ K_SEL = 12
 PRESET = "deep"
 TAKER_BPS = 10.0
 STRESS_MULT = 1.5
-T_PASS = 2.13               # 单候选保守阈(沿用加密协议)
+# RV-3 多重检验: 跨族总候选数 (与加密 runner 一致: btc A/B/C + eth A/B/C + stock ST720 = 7)。
+N_PARALLEL_CANDIDATES = 7
+# RV-4: ST720 的【板块】是从 4 个 OOS 板块桶 (见 POOLS) 里【同期】挑出的 -> 等效假设数须含板块搜索。
+SECTORS_SCREENED = 4
+bonferroni_t = fi.bonferroni_t
+# 候选族 + (板块数-1): 事后板块挑选放大 ST720 的有效假设数 -> 阈值更严
+T_PASS = bonferroni_t(N_PARALLEL_CANDIDATES + SECTORS_SCREENED - 1)   # ~2.58 (此前硬编码 2.13)
 N_MIN = 50
 N_KILL = 30
 WEEK_MS = 7 * 86_400_000
@@ -94,14 +102,16 @@ def _net(port: np.ndarray, cost_bps: float):
     return (st["net_bps"], st["nw_t"]) if st else (np.nan, np.nan)
 
 
-def forward_verdict(net15, t15, net10, n_ts, fwd_ic_sign, train_ic_sign, weeks) -> str:
-    """与加密 forward 协议同逻辑(纯函数)。"""
+def forward_verdict(net15, t15, net10, n_ts, fwd_ic_sign, train_ic_sign, weeks,
+                    t_pass: Optional[float] = None) -> str:
+    """与加密 forward 协议同逻辑(纯函数)。t_pass 默认用族级 Bonferroni 阈值 T_PASS。"""
+    tp = T_PASS if t_pass is None else t_pass
     if n_ts >= 8:
         if (net10 is not None and net10 <= 0) or (fwd_ic_sign != 0 and fwd_ic_sign != train_ic_sign):
             return "KILL"
     if weeks >= 8 and n_ts < N_KILL:
         return "KILL"
-    if (net15 is not None and net15 > 0 and (t15 or 0) > T_PASS and n_ts >= N_MIN
+    if (net15 is not None and net15 > 0 and (t15 or 0) > tp and n_ts >= N_MIN
             and fwd_ic_sign == train_ic_sign):
         return "PASS"
     return "PENDING"
@@ -140,7 +150,11 @@ def freeze() -> None:
         "top_frac": CANDIDATE["top_frac"], "bar_ms": bar_ms, "tau": tau,
         "ic_sign": CANDIDATE["oos_ic_sign"], "insample_ic_sign": insample_ic_sign, "n_sel": len(sel),
         "freeze_cutoff_ts": cutoff, "frozen_at_ms": stamp, "official_forward_start_ts": stamp,
+        # RV-4: 永久记录"板块是同期成本闸门事后挑选"这一出处, 任何 PASS 都须带此 caveat 解读
+        "sector_selection": "in_sample_costgate", "sectors_screened": SECTORS_SCREENED,
     }, indent=2), encoding="utf-8")
+    fi.write_manifest(d)                                # RV-1: 工件内容哈希清单
+    fi.clear_dead(FROZEN, CANDIDATE["code"])            # 重新冻结=全新登记, 清旧死标
     log(f"[freeze {CANDIDATE['code']}] H={H} {CANDIDATE['model']} 池化{len(CANDIDATE['symbols'])}只 "
         f"sel={len(sel)} tau={tau:.5f} oos_ic_sign={CANDIDATE['oos_ic_sign']:+d} "
         f"(in-sample {insample_ic_sign:+d}) cutoff={sc and pd.to_datetime(cutoff, unit='ms', utc=True)}")
@@ -153,6 +167,17 @@ def evaluate() -> None:
     if not (d / "meta.json").exists():
         log(f"[{CANDIDATE['code']}] 尚未冻结 — 先 --mode freeze"); return
     meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    # RV-1: 冻结后被改动 -> 排除 (不可再当有效前向测试)
+    tamper = fi.verify_manifest(d)
+    if tamper and tamper != "no-manifest":
+        log(f"[{CANDIDATE['code']}] ⚠ 预登记完整性失败: {tamper} -> EXCLUDED"); return
+    # RV-2: KILL 粘性 -> 已判死直接停, 不复活
+    dead = fi.read_dead(FROZEN, CANDIDATE["code"])
+    if dead:
+        log(f"[{CANDIDATE['code']}] 已判死(sticky, 不复活): {dead.get('reason')}"); return
+    # RV-3/RV-4: 阈值与事后板块提示
+    log(f"[{CANDIDATE['code']}] T_PASS={T_PASS:.3f} (Bonferroni 族{N_PARALLEL_CANDIDATES}+板块搜索{SECTORS_SCREENED}); "
+        "⚠ RV-4: 板块由同期成本闸门事后挑选 -> 任何 PASS 须在【预登记板块】上做第二段独立 forward 才可信。")
     H, bar_ms, tau = meta["H"], meta["bar_ms"], meta["tau"]
     official_start = max(int(meta["freeze_cutoff_ts"]), int(meta["official_forward_start_ts"]))
     train_ic_sign = meta["ic_sign"]
@@ -207,6 +232,11 @@ def evaluate() -> None:
             fic = cr._spearman(tr["score"].values, tr["fwd"].values) if len(tr) > 5 else 0.0
             fic_sign = int(np.sign(fic or 0.0))
             verdict = forward_verdict(net15, t15, net10, len(port), fic_sign, train_ic_sign, weeks)
+            if verdict == "KILL":               # RV-2: 落盘死标, 此后不复活
+                fi.write_dead(FROZEN, CANDIDATE["code"],
+                              f"forward KILL: net10={net10:.1f} fwd_ic_sign={fic_sign} "
+                              f"vs train={train_ic_sign} n_ts={len(port)} weeks={weeks:.1f}",
+                              {"net10_bps": round(net10, 1), "n_ts": int(len(port)), "weeks": round(weeks, 1)})
             row.update({"n_signals": len(tr), "n_ts": len(port),
                         "net10_bps": round(net10, 1), "t10": round(t10, 2),
                         "net15_bps": round(net15, 1), "t15": round(t15, 2),
@@ -394,12 +424,15 @@ def costgate() -> None:
 
 
 def selftest() -> None:
-    assert forward_verdict(5.0, 2.5, 6.0, 60, 1, 1, 2.0) == "PASS"
-    assert forward_verdict(5.0, 2.5, 6.0, 40, 1, 1, 2.0) == "PENDING"     # n<50
-    assert forward_verdict(5.0, 1.8, 6.0, 60, 1, 1, 2.0) == "PENDING"     # t<2.13
-    assert forward_verdict(5.0, 2.5, -1.0, 60, 1, 1, 2.0) == "KILL"       # net10<=0
-    assert forward_verdict(5.0, 2.5, 6.0, 60, -1, 1, 2.0) == "KILL"       # ic 反向
-    assert forward_verdict(5.0, 2.5, 6.0, 20, 1, 1, 9.0) == "KILL"        # 8wk 且 n<30
+    # 显式 t_pass=2.13 保持断言稳定; evaluate() 实际用更严的族级+板块 Bonferroni T_PASS。
+    assert forward_verdict(5.0, 2.5, 6.0, 60, 1, 1, 2.0, t_pass=2.13) == "PASS"
+    assert forward_verdict(5.0, 2.5, 6.0, 40, 1, 1, 2.0, t_pass=2.13) == "PENDING"     # n<50
+    assert forward_verdict(5.0, 1.8, 6.0, 60, 1, 1, 2.0, t_pass=2.13) == "PENDING"     # t<2.13
+    assert forward_verdict(5.0, 2.5, -1.0, 60, 1, 1, 2.0, t_pass=2.13) == "KILL"       # net10<=0
+    assert forward_verdict(5.0, 2.5, 6.0, 60, -1, 1, 2.0, t_pass=2.13) == "KILL"       # ic 反向
+    assert forward_verdict(5.0, 2.5, 6.0, 20, 1, 1, 9.0, t_pass=2.13) == "KILL"        # 8wk 且 n<30
+    # RV-3/RV-4: 事后挑板块 -> 阈值比旧 2.13 更严 (含板块搜索多重检验)
+    assert T_PASS > 2.13 and T_PASS >= bonferroni_t(N_PARALLEL_CANDIDATES + SECTORS_SCREENED - 1) - 1e-9
     log("selftest OK")
 
 
