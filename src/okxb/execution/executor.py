@@ -66,6 +66,14 @@ class Executor:
         # C-5: 开仓即在交易所端挂 reduce-only 止损 algo, 崩溃/断线/死手开关后仍生效
         self._exch_stop = bool(config.get("execution.exchange_resident_stop", True))
         self._exch_stop_market = bool(config.get("execution.exchange_resident_stop_market", True))
+        # H-7/H-9: 往返手续费率估计 (用于平仓净 PnL, 使熔断账目不偏乐观)
+        _fees = config.section("fees")
+        self._fee_roundtrip = (float(_fees.get("crypto_maker_pct", 0.02))
+                               + float(_fees.get("crypto_taker_pct", 0.05))) / 100.0
+        # 孤儿仓对账兜底止损用的保守止损距离 (从持仓均价起)
+        self._orphan_sl_frac = float(config.get("execution.orphan_stop_pct", 1.0)) / 100.0
+        self._bg_tasks: set = set()            # H-8: 持引用防 GC + 捕获 fire-and-forget 任务异常
+        self._orphan_armed: set = set()        # 已为之补挂保护止损的孤儿仓 (防每轮重复挂)
 
     def _ps(self, pos_dir: Side) -> str:
         """持仓方向 -> posSide。单向=net; 双向: 多=long 空=short。"""
@@ -77,21 +85,54 @@ class Executor:
     def _exit_reduce(self) -> bool:
         return self._pm == "net_mode"      # 双向模式由 posSide 决定平仓, 不传 reduceOnly
 
+    def _spawn(self, coro) -> None:
+        """H-8: fire-and-forget 任务必须持引用(防 GC) + done 回调里捕获异常(防静默死亡 -> 孤儿仓)。"""
+        t = asyncio.create_task(coro)
+        self._bg_tasks.add(t)
+        t.add_done_callback(self._on_task_done)
+
+    def _on_task_done(self, t) -> None:
+        self._bg_tasks.discard(t)
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            try:
+                self._alert(f"⚠ 执行后台任务异常({type(exc).__name__}: {exc}); 可能有未追踪仓, 已记审计待对账")
+                self._spawn_safe_audit("bg_task_error", repr(exc))
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _spawn_safe_audit(self, kind: str, msg: str) -> None:
+        try:
+            asyncio.create_task(self._store.audit(kind, msg))
+        except RuntimeError:
+            pass
+
     async def _place(self, **kw) -> dict:
         """优先 WS 下单 (低延迟), 失败回落 REST。
-        H-7a 防双发: WS 可能已把单送达交易所只是回执失败 -> 回落 REST 用【同一 clOrdId】重发,
-        交易所按 clOrdId 幂等, 重复会回 51016 -> 据此适配为"订单已存在", 绝不产生双仓。"""
+        H-7a 防双发: WS 可能已把单送达交易所只是回执失败 -> 回落前先按 clOrdId 查重, 命中即适配;
+        即便仍回落 REST 重发, 交易所按 clOrdId 幂等回 51016, 再据此适配为"订单已存在", 绝不双仓。"""
         cl = kw.get("cl_ord_id")
         if self._ws_order is not None and getattr(self._ws_order, "logged_in", False):
             try:
                 return await self._ws_order.place_order(**kw)
             except OkxError as e:
                 await self._store.audit("ws_place_fallback", repr(e))
+                if cl:                         # WS 可能已送达 -> 回落 REST 前先查重, 命中则不重发
+                    try:
+                        o = await self._rest.get_order(kw["inst_id"], cl_ord_id=cl)
+                        if o and o.get("state") in ("live", "partially_filled", "filled"):
+                            await self._store.audit("ws_dedup", f"{kw['inst_id']} {cl} 已存在({o.get('state')}), 不重发")
+                            return {"ordId": o.get("ordId"), "sCode": "0", "_deduped": True}
+                    except OkxError:
+                        pass                   # 查不到 -> 确未到达, 安全回落
         try:
             return await self._rest.place_order(**kw)
         except OkxError as e:
-            if cl and ("51016" in str(e) or "duplicat" in str(e).lower()):
-                await self._store.audit("place_dedup", f"{kw.get('inst_id')} {cl} 重复clOrdId -> 适配已存在单")
+            if cl and getattr(e, "code", "") == "51016":   # 精确匹配 sCode, 不用子串(防误判)
+                await self._store.audit("place_dedup", f"{kw.get('inst_id')} {cl} 51016 重复clOrdId -> 适配已存在单")
                 try:
                     o = await self._rest.get_order(kw["inst_id"], cl_ord_id=cl)
                     return {"ordId": o.get("ordId"), "sCode": "0", "_deduped": True}
@@ -184,14 +225,15 @@ class Executor:
         if sig.taker:
             # IOC: 立即成交或取消; 有界重试查回成交(防 accFillSz 结算延迟漏建仓)后建仓
             state, filled, avg = await self._resolve_order(inst, cl_oid)
-            if filled > 0:
-                await self._open_managed(inst, sig, filled, avg or Decimal(str(px)))
-            elif state == "unknown":
+            if filled > 0 or state in ("filled", "partially_filled"):
+                await self._open_managed(inst, sig, filled or contracts, avg or Decimal(str(px)))
+            elif state != "canceled":
+                # 非干净撤销 (unknown / 仍 live 且未拿到成交) -> 挂对账, 绝不静默丢弃可能已成交的单
                 await self._store.audit("taker_reconcile_needed",
-                                        f"{inst} {cl_oid} IOC 成交未知, 待对账 (避免漏建裸仓)")
+                                        f"{inst} {cl_oid} IOC 成交未定(state={state}), 待对账 (避免漏建裸仓)")
         else:
             ttl = (self._ttl_min + self._ttl_max) / 2 / 1000.0
-            asyncio.create_task(self._ttl_watch(inst, cl_oid, sig, contracts, px, ttl))
+            self._spawn(self._ttl_watch(inst, cl_oid, sig, contracts, px, ttl))
 
     async def _ttl_watch(self, inst, cl_oid, sig, contracts, px, ttl_s) -> None:
         await asyncio.sleep(ttl_s)
@@ -318,22 +360,15 @@ class Executor:
             return True
         return False
 
-    async def close_position(self, pos: ManagedPosition, reason: str, mid: Decimal) -> None:
-        pos.closing = True
+    def _net_pnl(self, pos: ManagedPosition, fill_px: Decimal, filled: Decimal) -> float:
+        """已实现【净】盈亏 = 毛 − 往返手续费估计 (H-9: 喂熔断账目不偏乐观)。"""
         sign = 1 if pos.side == Side.BUY else -1
         ctval = Decimal(str(self._inst.ct_val(pos.inst_id)))
-        exit_side = Side.SELL if pos.side == Side.BUY else Side.BUY
+        gross = float((fill_px - pos.entry_px) * sign * filled * ctval)
+        fee = abs(float(fill_px) * float(filled) * float(ctval)) * self._fee_roundtrip
+        return gross - fee
 
-        if self.dry_run:                       # 演练: 用 mid 估算, 直接记账平仓
-            pnl = float((mid - pos.entry_px) * sign * pos.contracts * ctval)
-            self._risk.register_close(pnl)
-            await self._persist_risk()
-            await self._store.record_pnl(pos.inst_id, pos.strategy.value, pnl, {"reason": reason, "dry": True})
-            self._om.remove_position(pos.inst_id)
-            self._alert(f"⛔ 平仓(演练) {pos.inst_id} {reason} pnl~{pnl:.3f}U")
-            return
-
-        # 撤未成交止盈单 + 交易所端止损 algo (避免与平仓单并存)
+    async def _cancel_protection(self, pos: ManagedPosition) -> None:
         if pos.tp_order_oid:
             try:
                 await self._rest.cancel_order(pos.inst_id, ord_id=pos.tp_order_oid)
@@ -345,7 +380,23 @@ class Executor:
             except OkxError:
                 pass
 
-        pos.close_attempts += 1                # 每次平仓用不同 clOrdId: 防重发去重 + 支持剩余量重试
+    async def close_position(self, pos: ManagedPosition, reason: str, mid: Decimal) -> None:
+        pos.closing = True
+        exit_side = Side.SELL if pos.side == Side.BUY else Side.BUY
+
+        if self.dry_run:                       # 演练: 用 mid 估算净额, 直接记账平仓
+            pnl = self._net_pnl(pos, mid, pos.contracts)
+            self._risk.register_close(pnl)
+            await self._persist_risk()
+            await self._store.record_pnl(pos.inst_id, pos.strategy.value, pnl, {"reason": reason, "dry": True})
+            self._om.remove_position(pos.inst_id)
+            self._alert(f"⛔ 平仓(演练) {pos.inst_id} {reason} pnl~{pnl:.3f}U")
+            return
+
+        # H-7-A: 先下平仓 IOC, 交易所端 SL/TP 暂【保留】; 只有确认全平后才撤保护 ->
+        # 部分/零成交时剩余仓位仍受原 SL/TP 守护, 消除"撤了保护却没平掉"的裸仓窗口。
+        # (SL algo 与平仓单同为 reduce-only, 即便同时触发也不会超额平仓。)
+        pos.close_attempts += 1                # 计数前置于 clOrdId, 截断后仍唯一: 防重发去重 + 支持续平
         cl = _clean_oid(f"cl{pos.close_attempts}{pos.signal_id}")
         try:
             await self._rest.place_order(
@@ -355,31 +406,79 @@ class Executor:
             )
         except OkxError as e:
             await self._store.audit("close_reject", f"{pos.inst_id} {e}")
-            pos.closing = False                # H-7d 下单失败 -> 保持持仓, 下拍重试; 绝不假装已平
+            pos.closing = False                # 下单失败 -> 保持持仓+原保护, 下拍重试; 绝不假装已平
             return
 
-        # H-7d 查实际成交: 只有【全部成交】才移除持仓; 部分成交记账并留剩余量; 零成交保持持仓重试。
-        # 此前无条件 register_close+remove -> 平仓单没打成也被当已离场 = 风控以为平了实则裸仓继续亏。
         state, filled, avg = await self._resolve_order(pos.inst_id, cl)
-        if filled <= 0:
-            await self._store.audit("close_unfilled", f"{pos.inst_id} 平仓IOC未成交(state={state}), 保持持仓待重试")
+        if filled <= 0:                        # 未成交: 保留持仓+原 SL/TP (幽灵仓由 reconcile_positions 兜底清理)
+            await self._store.audit("close_unfilled", f"{pos.inst_id} 平仓IOC未成交(state={state}), 保持持仓+原止损待重试")
             pos.closing = False
             return
-        fill_px = avg or mid                   # H-9: 用真实成交价算 PnL, 而非 mid 估算
-        pnl = float((fill_px - pos.entry_px) * sign * filled * ctval)
-        self._risk.register_close(pnl)
+        fill_px = avg or mid                   # H-9: 用真实成交价算 PnL
+        if filled < pos.contracts:             # 部分成交: 记分片(非终态不动连亏), 留剩余量, 原 SL/TP 仍守护
+            pnl = self._net_pnl(pos, fill_px, filled)
+            self._risk.register_close(pnl, final=False)
+            await self._persist_risk()
+            await self._store.record_pnl(pos.inst_id, pos.strategy.value, pnl,
+                                         {"reason": reason, "fill_px": str(fill_px), "filled": str(filled), "partial": True})
+            pos.contracts = pos.contracts - filled
+            pos.closing = False
+            await self._store.audit("close_partial", f"{pos.inst_id} 部分平{filled} 剩{pos.contracts}(原止损仍守)")
+            self._alert(f"⚠ 部分平仓 {pos.inst_id} {reason} 已平{filled} 剩{pos.contracts} pnl~{pnl:.3f}U")
+            return
+        # 全部成交 -> 此时才撤交易所端 TP/SL (先前不撤, 故部分成交不会裸仓)
+        await self._cancel_protection(pos)
+        pnl = self._net_pnl(pos, fill_px, filled)
+        self._risk.register_close(pnl, final=True)
         await self._persist_risk()
         await self._store.record_pnl(pos.inst_id, pos.strategy.value, pnl,
                                      {"reason": reason, "fill_px": str(fill_px), "filled": str(filled)})
-        if filled < pos.contracts:             # 部分成交: 记已平部分, 更新剩余, 保持持仓(下拍续平)
-            pos.contracts = pos.contracts - filled
-            pos.closing = False
-            await self._store.audit("close_partial", f"{pos.inst_id} 部分平{filled} 剩{pos.contracts}")
-            self._alert(f"⚠ 部分平仓 {pos.inst_id} {reason} 已平{filled} 剩{pos.contracts} pnl~{pnl:.3f}U")
-            return
+        self._orphan_armed.discard(pos.inst_id)
         await self._store.audit("closed", f"{pos.inst_id} {reason} pnl~{pnl:.3f} fill@{fill_px}")
         self._om.remove_position(pos.inst_id)
         self._alert(f"⛔ 平仓 {pos.inst_id} {reason} pnl~{pnl:.3f}U 状态={self._risk.system_state.value}")
+
+    async def reconcile_positions(self, real_positions: list, *, ghost_min_age_ms: int = 15_000) -> None:
+        """H-7 critical: 闭合"挂了对账日志却无人消费"的洞。周期对账交易所真实持仓 vs 本地受管:
+          - 孤儿仓 (交易所有 / 本地无): 立即补挂保护性 reduce-only 止损 + 告警 (覆盖 IOC 漏建/任务死亡等);
+          - 幽灵仓 (本地有 / 交易所无, 且足够老以排除快照延迟): 移除本地受管 (已被 SL/TP/外部平掉)。"""
+        if self.dry_run:
+            return
+        real = {}
+        for p in (real_positions or []):
+            inst = p.get("instId")
+            if inst and abs(float(p.get("pos") or 0)) > 0:
+                real[inst] = p
+        # 1) 孤儿仓 -> 补挂保护止损
+        for inst, p in real.items():
+            if self._om.has(inst) or inst in self._orphan_armed:
+                continue
+            try:
+                long = float(p.get("pos") or 0) > 0
+                avg = float(p.get("avgPx") or 0)
+                sz = abs(float(p.get("pos") or 0))
+                if avg <= 0:
+                    continue
+                sl_raw = avg * (1 - self._orphan_sl_frac) if long else avg * (1 + self._orphan_sl_frac)
+                sl_px = round_price(sl_raw, self._inst.tick_sz(inst), side_up=(not long))
+                await self._rest.place_algo_order(
+                    inst_id=inst, td_mode=self._td_mode, side=(Side.SELL if long else Side.BUY).value,
+                    sz=str(sz), pos_side=("net" if self._pm == "net_mode" else ("long" if long else "short")),
+                    reduce_only=(self._pm == "net_mode"),
+                    sl_trigger_px=str(sl_px), sl_ord_px="-1", trigger_px_type="last")
+                self._orphan_armed.add(inst)
+                await self._store.audit("orphan_protected", f"{inst} 未追踪仓 sz={sz}@{avg} 补挂止损@{sl_px}")
+                self._alert(f"⚠ 发现未追踪持仓 {inst} sz={sz}@{avg}, 已补挂交易所端止损@{sl_px} (请人工核查来源)")
+            except OkxError as e:
+                await self._store.audit("orphan_protect_fail", f"{inst} {e}")
+        # 2) 幽灵仓 -> 清理本地 (加 age 守护, 避免误删快照尚未反映的新仓)
+        now = int(time.time() * 1000)
+        for mp in self._om.all():
+            if mp.inst_id not in real and (now - mp.entry_ms) > ghost_min_age_ms:
+                self._om.remove_position(mp.inst_id)
+                self._orphan_armed.discard(mp.inst_id)
+                await self._store.audit("ghost_removed", f"{mp.inst_id} 交易所已无此仓(疑被SL/TP/外部平), 清理本地受管")
+                self._alert(f"ℹ {mp.inst_id} 交易所已无持仓, 清理本地记录")
 
     async def arm_kill_switch(self) -> None:
         if self.dry_run or not self._cfg.get("execution.cancel_all_after.enabled", True):

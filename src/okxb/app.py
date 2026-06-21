@@ -232,6 +232,8 @@ class App:
             self._acct_upl = sum(float(p.get("upl", 0) or 0) for p in live)
             self._acct_pos_map = {p["instId"]: p for p in live if p.get("instId")}
             self._acct_ok = True
+            if self.executor is not None:      # H-7: 对账孤儿/幽灵仓 (闭合"挂对账日志却无人消费"的洞)
+                await self.executor.reconcile_positions(live)
         except Exception:
             pass            # 网络抖动等; 外层主循环已兜底, 保留上次权益
 

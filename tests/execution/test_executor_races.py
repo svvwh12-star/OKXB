@@ -7,6 +7,7 @@ Covers the four races the audit flagged:
   H-7d close IOC unfilled/partial -> position kept/updated, NOT fake-closed (no untracked naked position)
 """
 import asyncio
+import time
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -66,6 +67,7 @@ class FakeStore:
     async def audit(self, k, m): self.audits.append((k, m))
     async def record_pnl(self, *a, **k): pass
     async def record_signal(self, *a, **k): pass
+    async def upsert_order(self, *a, **k): pass
     async def set_kv(self, *a, **k): pass
 
 
@@ -96,15 +98,38 @@ def _has(audits, kind):
 
 # ----------------- H-7a: WS->REST dedup via clOrdId idempotency -----------------
 
-def test_ws_fail_rest_duplicate_adopts_existing_no_double():
-    rest = FakeRest(place_exc=OkxError("51016", "Duplicated clOrdId", "trade/order"),
-                    get_default={"ordId": "EXIST", "state": "live", "accFillSz": "0"})
+def test_ws_fail_probe_finds_existing_no_resend():
+    # WS errored but the order DID land -> pre-probe finds it -> adopt, do NOT resend via REST
+    rest = FakeRest(get_default={"ordId": "EXIST", "state": "live", "accFillSz": "0"})
     ex = _ex(rest, ws=WSDown())
     res = asyncio.run(ex._place(inst_id="BTC-USDT-SWAP", td_mode="isolated", side="buy",
                                 ord_type="post_only", sz="5", px="100", pos_side="net",
                                 reduce_only=False, cl_ord_id="okxbsig1"))
     assert res.get("_deduped") is True and res.get("ordId") == "EXIST"
-    assert len(rest.placed) == 1                     # exactly one REST resend, not a loop
+    assert len(rest.placed) == 0                     # never resent -> no double order
+
+
+def test_rest_duplicate_51016_adopted():
+    # no WS; REST resend hits exact 51016 -> adopt existing instead of treating as failure
+    rest = FakeRest(place_exc=OkxError("51016", "Duplicated clOrdId", "trade/order"),
+                    get_default={"ordId": "EXIST", "state": "filled", "accFillSz": "5", "avgPx": "100"})
+    ex = _ex(rest, ws=None)
+    res = asyncio.run(ex._place(inst_id="BTC-USDT-SWAP", td_mode="isolated", side="buy",
+                                ord_type="post_only", sz="5", px="100", pos_side="net",
+                                reduce_only=False, cl_ord_id="okxbsig1"))
+    assert res.get("_deduped") is True and res.get("ordId") == "EXIST"
+
+
+def test_rest_non_dedup_error_propagates():
+    rest = FakeRest(place_exc=OkxError("50001", "server error", "trade/order"))
+    ex = _ex(rest, ws=None)
+    try:
+        asyncio.run(ex._place(inst_id="BTC-USDT-SWAP", td_mode="isolated", side="buy",
+                              ord_type="post_only", sz="5", px="100", pos_side="net",
+                              reduce_only=False, cl_ord_id="okxbsig1"))
+        assert False, "should have raised"
+    except OkxError as e:
+        assert e.code == "50001"                     # non-dedup errors are NOT swallowed
 
 
 # ----------------- H-7b: TTL cancel races a fill -----------------
@@ -166,7 +191,7 @@ def test_resolve_order_canceled_is_terminal_no_fill():
 
 # ----------------- H-7d: close reconciliation -----------------
 
-def test_close_unfilled_keeps_position():
+def test_close_unfilled_keeps_position_and_protection():
     rest = FakeRest(get_default={"state": "canceled", "accFillSz": "0"})   # IOC didn't fill
     ex = _ex(rest)
     pos = _pos("5")
@@ -176,18 +201,22 @@ def test_close_unfilled_keeps_position():
     assert pos.closing is False                             # released for retry next tick
     assert ex._risk.total_pnl == 0.0                        # no PnL booked for a non-fill
     assert _has(ex._store.audits, "close_unfilled")
+    assert not rest.canceled and not rest.canceled_algos    # protection NOT cancelled -> still guarded
 
 
-def test_close_partial_keeps_remainder():
+def test_close_partial_keeps_remainder_with_protection():
     rest = FakeRest(get_default={"state": "filled", "accFillSz": "3", "avgPx": "100"})
     ex = _ex(rest)
     pos = _pos("5")
     ex._om.add_position(pos)
+    before_consec = ex._risk.consecutive_losses
     asyncio.run(ex.close_position(pos, "止损", Decimal("100")))
     kept = ex._om.get("BTC-USDT-SWAP")
     assert kept is not None and kept.contracts == Decimal("2")   # 5 - 3 remaining
     assert pos.closing is False
     assert _has(ex._store.audits, "close_partial")
+    assert not rest.canceled and not rest.canceled_algos    # remainder's SL/TP still live (H-7-A fix)
+    assert ex._risk.consecutive_losses == before_consec     # partial slice must NOT bump consec losses
 
 
 def test_close_full_removes_position():
@@ -210,3 +239,72 @@ def test_close_reject_keeps_position():
     assert ex._om.get("BTC-USDT-SWAP") is not None          # place failed -> keep, don't fake-close
     assert pos.closing is False
     assert _has(ex._store.audits, "close_reject")
+
+
+# ----------------- taker IOC must never silently drop a possibly-filled order -----------------
+
+def _taker_sig():
+    return SimpleNamespace(inst_id="BTC-USDT-SWAP", side=Side.BUY, taker=True,
+                           sl_pct=0.01, tp_pct=0.02, strategy=StrategyId.HFM80, signal_id="sigT",
+                           composite_score=80.0, edge_to_cost=2.0, model_prob=0.6)
+
+
+def test_taker_opens_on_fill():
+    rest = FakeRest(get_default={"state": "filled", "accFillSz": "5", "avgPx": "100"})
+    ex = _ex(rest)
+    asyncio.run(ex.submit(_taker_sig(), Decimal("50"), True))
+    assert ex._om.has("BTC-USDT-SWAP")
+
+
+def test_taker_filled_state_zero_accfill_still_opens():
+    rest = FakeRest(get_default={"state": "filled", "accFillSz": "0"})   # state terminal, accFillSz lags
+    ex = _ex(rest)
+    asyncio.run(ex.submit(_taker_sig(), Decimal("50"), True))
+    assert ex._om.has("BTC-USDT-SWAP")                   # opened with requested size, not dropped
+
+
+def test_taker_unknown_flags_reconcile():
+    rest = FakeRest()
+
+    async def _raise(inst, **kw):
+        raise OkxError("50001", "down", "get")
+    rest.get_order = _raise
+    ex = _ex(rest)
+    asyncio.run(ex.submit(_taker_sig(), Decimal("50"), True))
+    assert not ex._om.has("BTC-USDT-SWAP")
+    assert _has(ex._store.audits, "taker_reconcile_needed")
+
+
+# ----------------- reconcile_positions: close the orphan/ghost loop (review CRITICAL) -----------------
+
+def test_reconcile_arms_orphan_stop_idempotent():
+    rest = FakeRest()
+    ex = _ex(rest)
+    real = [{"instId": "BTC-USDT-SWAP", "pos": "5", "avgPx": "100"}]
+    asyncio.run(ex.reconcile_positions(real))
+    assert len(rest.algos) == 1                          # protective reduce-only SL placed
+    assert "BTC-USDT-SWAP" in ex._orphan_armed
+    assert _has(ex._store.audits, "orphan_protected")
+    asyncio.run(ex.reconcile_positions(real))            # idempotent: no second arm
+    assert len(rest.algos) == 1
+
+
+def test_reconcile_skips_managed():
+    rest = FakeRest()
+    ex = _ex(rest)
+    ex._om.add_position(_pos("5"))
+    asyncio.run(ex.reconcile_positions([{"instId": "BTC-USDT-SWAP", "pos": "5", "avgPx": "100"}]))
+    assert len(rest.algos) == 0                          # already tracked -> not an orphan
+
+
+def test_reconcile_removes_old_ghost_keeps_fresh():
+    rest = FakeRest()
+    ex = _ex(rest)
+    old = _pos("5", entry_ms=0)                           # ancient -> real ghost if absent
+    fresh = _pos("3", inst_id="ETH-USDT-SWAP", entry_ms=int(time.time() * 1000))
+    ex._om.add_position(old)
+    ex._om.add_position(fresh)
+    asyncio.run(ex.reconcile_positions([]))              # exchange reports no positions
+    assert ex._om.get("BTC-USDT-SWAP") is None            # old ghost cleaned up
+    assert ex._om.get("ETH-USDT-SWAP") is not None        # fresh kept (snapshot-lag age guard)
+    assert _has(ex._store.audits, "ghost_removed")

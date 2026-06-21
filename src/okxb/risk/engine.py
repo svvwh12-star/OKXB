@@ -141,15 +141,18 @@ class RiskEngine:
         self.high_vol = flag
         self._update_system_state()
 
-    def register_close(self, pnl_usdt: float) -> None:
+    def register_close(self, pnl_usdt: float, final: bool = True) -> None:
+        """final=False 用于【部分平仓的中间分片】: 仍累计盈亏/权益, 但不动连亏计数,
+        避免同一笔决策被分N次平仓时把 consecutive_losses 放大N倍 (H-7 review)。"""
         self.day_pnl += pnl_usdt
         self.total_pnl += pnl_usdt
         self.equity += pnl_usdt
         self.peak_equity = max(self.peak_equity, self.equity)
-        if pnl_usdt < 0:
-            self.consecutive_losses += 1
-        else:
-            self.consecutive_losses = 0
+        if final:
+            if pnl_usdt < 0:
+                self.consecutive_losses += 1
+            else:
+                self.consecutive_losses = 0
         self._update_system_state()
 
     def reset_day(self) -> None:
