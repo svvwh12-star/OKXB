@@ -29,13 +29,15 @@ from .controller import (PARAM_DEFS, EngineController, account_brief_sync, ai_an
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-FONT = ("Microsoft YaHei UI", 13)
+FONT = ("Microsoft YaHei UI", 14)
 FONT_B = ("Microsoft YaHei UI", 15, "bold")
 FONT_BIG = ("Microsoft YaHei UI", 22, "bold")
-MONO = ("Consolas", 12)
+FONT_S = ("Microsoft YaHei UI", 12)        # 小字: 提示/图例/横幅 (集中可调)
+MONO = ("Consolas", 13)
 
-GREEN, RED, GREY, AMBER = "#27c08a", "#f0616d", "#8a8d93", "#e0a800"
+GREEN, RED, GREY, AMBER = "#27c08a", "#f0616d", "#a8acb3", "#e0a800"
 TXT = "#d6d6d6"   # 普通文字色 (CustomTkinter 不接受 text_color=None)
+LOWQ = "#c08020"  # 低质量/受限状态的琥珀棕 (与 AMBER 语义区分, 集中定义)
 
 
 class _ToolTip:
@@ -96,8 +98,8 @@ class OKXBApp(ctk.CTk):
         self._orders_busy = False
         self._acct_brief = None       # 控制台卡片真实账户快照 (独立于引擎)
         self._acct_busy = False
-        self._sort_col = "long"          # 控制台表格排序列(行字典键)
-        self._sort_desc = True           # True=由大到小
+        self._sort_col = "inst"          # 默认按【标的】升序: 稳定不随分数跳动 (点列名可改其它列)
+        self._sort_desc = False          # True=由大到小
         self._table_order = None         # 上次packing签名, 避免无谓重排
         self._hdr_buttons: dict = {}     # 列键 -> (按钮, 基础名)
         try:
@@ -109,8 +111,8 @@ class OKXBApp(ctk.CTk):
         ctk.CTkLabel(
             self, text="ⓘ AI选品/分析 = 信息聚合与决策辅助, 非价格预测·无已验证 edge; "
                        "AI 不自动下单, 每笔手动单仍走 RiskEngine 额度闸门 · 建议先 demo 验证。",
-            font=("Microsoft YaHei UI", 11), text_color="#d08770",
-            anchor="w", wraplength=1400, justify="left").pack(fill="x", padx=14, pady=(0, 4))
+            font=FONT_S, text_color="#d08770",
+            anchor="w", wraplength=1000, justify="left").pack(fill="x", padx=14, pady=(0, 4))
         self._tabs = ctk.CTkTabview(self, width=1000, height=560)
         self._tabs.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self._tab_console = self._tabs.add("控制台")
@@ -143,7 +145,7 @@ class OKXBApp(ctk.CTk):
                                        fg_color=GREEN, hover_color="#1fa476",
                                        command=self._on_start)
         self.start_btn.pack(side="right", padx=(8, 16))
-        self.stop_btn = ctk.CTkButton(bar, text="■ 停止", font=FONT_B, width=90,
+        self.stop_btn = ctk.CTkButton(bar, text="■ 停止", font=FONT_B, width=110,
                                       fg_color=RED, hover_color="#c94d57",
                                       command=self._on_stop, state="disabled")
         self.stop_btn.pack(side="right", padx=8)
@@ -196,10 +198,10 @@ class OKXBApp(ctk.CTk):
         self.pick_pool.set("全部"); self.pick_pool.pack(side="left", padx=8)
         ctk.CTkButton(pbar, text="🤖 AI选品推荐", font=FONT_B, width=120, fg_color="#7a5cff",
                       command=self._ai_pick_run).pack(side="left", padx=4)
-        ctk.CTkLabel(pbar, text="(点列名可排序↑↓)", font=("Microsoft YaHei UI", 11),
+        ctk.CTkLabel(pbar, text="(点列名可排序↑↓)", font=FONT_S,
                      text_color=GREY).pack(side="left", padx=8)
-        ctk.CTkButton(pbar, text="⚠ 一键全平", font=FONT_B, width=100, fg_color="#a83232",
-                      hover_color="#922", command=self._console_close_all).pack(side="right", padx=6)
+        ctk.CTkButton(pbar, text="⚠ 一键全平", font=FONT_B, width=120, fg_color="#a83232",
+                      hover_color="#922", command=self._console_close_all).pack(side="right", padx=(24, 6))
 
         ctk.CTkLabel(t, text="实时行情 / 信号 (达入场门槛+确认+连续N拍才触发; 点某行可带入『手动交易』)",
                      font=FONT_B, anchor="w").pack(fill="x", padx=14, pady=(6, 2))
@@ -209,23 +211,25 @@ class OKXBApp(ctk.CTk):
                     "质量=行情质量/可交易环境(0–100, 流动性×波动; 高≠该交易, 只代表好执行) · "
                     "入场=该标的入场状态(✓候选/方向不足/质量低/未确认/死盘/预热/价差宽) · 持仓=●持有。"
                     "真正开仓还需在『✓候选』基础上 连续N拍+冷却+净edge。点列名排序(再点切升/降)。",
-            font=("Microsoft YaHei UI", 11), text_color=GREY, anchor="w",
-            wraplength=1020, justify="left").pack(fill="x", padx=14, pady=(0, 4))
+            font=FONT_S, text_color=GREY, anchor="w",
+            wraplength=900, justify="left").pack(fill="x", padx=14, pady=(0, 4))
         self._table = ctk.CTkScrollableFrame(t, height=320)
         self._table.pack(fill="both", expand=True, padx=8, pady=4)
         self._build_table_header()
 
     # 列定义: (显示名, 行字典键, 宽度)
-    TABLE_COLS = [("标的", "inst", 140), ("中间价", "mid", 100), ("价差bps", "spread_bps", 72),
+    TABLE_COLS = [("标的", "inst", 140), ("中间价", "mid", 96), ("价差bps", "spread_bps", 72),
                   ("OBI_z", "obi_z", 64), ("OFI_z", "ofi_z", 64), ("多", "long", 52),
-                  ("空", "short", 52), ("质量", "trad", 52), ("入场", "entry", 80), ("持仓", "has_pos", 54)]
+                  ("空", "short", 52), ("质量", "trad", 52), ("入场", "entry", 96), ("持仓", "has_pos", 54)]
+    _LEFT_COLS = {"inst", "entry", "pos", "has_pos"}     # 这些左对齐, 其余数字列右对齐(小数点对齐)
 
     def _build_table_header(self) -> None:
         self._col_widths = [w for _, _, w in self.TABLE_COLS]
         hdr = ctk.CTkFrame(self._table, fg_color="#2b2b2b")
         hdr.pack(fill="x", pady=(0, 2))
         for name, key, w in self.TABLE_COLS:
-            b = ctk.CTkButton(hdr, text=name, font=FONT_B, width=w, height=24, anchor="w",
+            b = ctk.CTkButton(hdr, text=name, font=FONT_B, width=w, height=24,
+                              anchor=("w" if key in self._LEFT_COLS else "e"),
                               fg_color="#2b2b2b", hover_color="#3a3a3a", text_color=TXT,
                               command=lambda k=key: self._set_sort(k))
             b.pack(side="left", padx=2)
@@ -271,7 +275,8 @@ class OKXBApp(ctk.CTk):
             labels = {}
             keys = ["inst", "mid", "spread", "obi", "ofi", "long", "short", "trad", "entry", "pos"]
             for k, w in zip(keys, self._col_widths):
-                lb = ctk.CTkLabel(fr, text="-", font=MONO, width=w, anchor="w")
+                lb = ctk.CTkLabel(fr, text="-", font=MONO, width=w,
+                                  anchor=("w" if k in self._LEFT_COLS else "e"))
                 lb.pack(side="left", padx=2)
                 labels[k] = lb
             labels["inst"].configure(text=inst, font=FONT)
@@ -320,7 +325,7 @@ class OKXBApp(ctk.CTk):
             t, text="左=查看/手动调整每个参数 + 存取命名预设; 右=用录制数据回测找最优并一键应用。"
                     "『校准(最近录制)』只用最新一个 calib 文件(本次会话); 『校准(全部)』合并所有文件(更多数据)。"
                     "二者算法相同, 只是数据范围不同。",
-            font=("Microsoft YaHei UI", 11), text_color=GREY, anchor="w",
+            font=FONT_S, text_color=GREY, anchor="w",
             wraplength=1980, justify="left").pack(fill="x", padx=12)
 
         split = ctk.CTkFrame(t, fg_color="transparent")
@@ -347,13 +352,13 @@ class OKXBApp(ctk.CTk):
                       command=self._preset_save).pack(side="left", padx=2)
 
         pf = ctk.CTkScrollableFrame(left, height=300); pf.pack(fill="both", expand=True, padx=8, pady=4)
-        ctk.CTkLabel(pf, text="把鼠标停在参数名上看详细讲解 ⓘ", font=("Microsoft YaHei UI", 11),
+        ctk.CTkLabel(pf, text="把鼠标停在参数名上看详细讲解 ⓘ", font=FONT_S,
                      text_color="#7fb0ff", anchor="w").pack(fill="x", pady=(0, 2))
         self._param_entries = {}
         cur = current_params()
         for key, label, typ in PARAM_DEFS:
             row = ctk.CTkFrame(pf, fg_color="transparent"); row.pack(fill="x", pady=1)
-            lab = ctk.CTkLabel(row, text="ⓘ " + label, font=("Microsoft YaHei UI", 11),
+            lab = ctk.CTkLabel(row, text="ⓘ " + label, font=FONT_S,
                                width=260, anchor="w", text_color="#cfe0ff")
             lab.pack(side="left")
             tip = TOOLTIPS.get(key, "")
@@ -373,7 +378,7 @@ class OKXBApp(ctk.CTk):
         ctk.CTkLabel(left, text="想多出手/更满仓→载入『宽松(多出手)』, 或调低 入场分/确认/持续/edge + 调高 "
                      "同时持仓数/每笔风险预算; 改完点『应用』, 重启引擎生效。"
                      "注: 信号是间歇的, 调大并发只是'有信号时能多开', 不保证时刻满仓。",
-                     font=("Microsoft YaHei UI", 11), text_color=GREY, anchor="w",
+                     font=FONT_S, text_color=GREY, anchor="w",
                      wraplength=540, justify="left").pack(fill="x", padx=8)
 
         # ---- 右: 校准 ----
@@ -585,13 +590,15 @@ class OKXBApp(ctk.CTk):
         rows = self.ctrl.rows()    # 引擎在跑则带实时信号分; 没跑则用交易所24h真实数据兜底
         win = ctk.CTkToplevel(self)
         win.title("AI 选品推荐")
-        win.geometry("720x520")
+        win.geometry("960x720")
+        win.minsize(720, 520)
+        win.resizable(True, True)
         win.transient(self)
         ctk.CTkLabel(win, text=f"AI 选品 · {self.pick_pool.get()} (分析中, 约数秒…)",
                      font=FONT_B).pack(anchor="w", padx=12, pady=(10, 4))
-        box = ctk.CTkTextbox(win, height=180, font=MONO)
-        box.pack(fill="x", padx=12, pady=4)
-        listfr = ctk.CTkScrollableFrame(win, height=240)
+        box = ctk.CTkTextbox(win, height=240, font=MONO)
+        box.pack(fill="both", expand=True, padx=12, pady=4)   # 随窗口放大
+        listfr = ctk.CTkScrollableFrame(win, height=300)
         listfr.pack(fill="both", expand=True, padx=12, pady=6)
 
         def work():
@@ -634,7 +641,7 @@ class OKXBApp(ctk.CTk):
     def _show_pnl_stats(self) -> None:
         from .controller import pnl_stats_sync
         win = ctk.CTkToplevel(self)
-        win.title("盈亏统计"); win.geometry("440x320"); win.transient(self)
+        win.title("盈亏统计"); win.geometry("480x420"); win.minsize(440, 320); win.transient(self)
         ctk.CTkLabel(win, text="盈亏统计 (已实现按平仓时间; 近3月数据)", font=FONT_B).pack(
             anchor="w", padx=14, pady=(12, 6))
         box = ctk.CTkTextbox(win, font=MONO)
@@ -702,7 +709,7 @@ class OKXBApp(ctk.CTk):
         self.region_menu.set(env.get("OKX_REGION", "global"))
         self.region_menu.pack(anchor="w", pady=4)
         ctk.CTkLabel(scroll, text="global=全球站(非美非欧)  us=美(仅现货)  eea=欧盟",
-                     font=("Microsoft YaHei UI", 11), text_color=GREY, anchor="w").pack(fill="x")
+                     font=FONT_S, text_color=GREY, anchor="w").pack(fill="x")
 
         self.cred_entries: dict[str, ctk.CTkEntry] = {}
         self._cred_section(scroll, "虚拟盘 (Demo / 模拟盘) — 需在 OKX「Demo Trading」区创建的密钥",
@@ -737,7 +744,7 @@ class OKXBApp(ctk.CTk):
         self.ai_provider_menu.set(cur)
         self.ai_provider_menu.pack(side="left", padx=6)
         ctk.CTkLabel(prow, text="按任务难度自动选模型 (简单→便宜, 复杂→更强)",
-                     font=("Microsoft YaHei UI", 11), text_color=GREY).pack(side="left", padx=8)
+                     font=FONT_S, text_color=GREY).pack(side="left", padx=8)
 
         self._opt_entry(scroll, "AI API Key", "AI_API_KEY", env)
         self._opt_entry(scroll, "Base URL", "AI_BASE_URL", env, mask=False,
@@ -755,10 +762,10 @@ class OKXBApp(ctk.CTk):
             env.get("AI_TIER_POLICY", "auto"), "自动(按难度)"))
         self.ai_tier_menu.pack(side="left", padx=6)
         ctk.CTkLabel(trow, text="每次调用都会在『日志』里打印实际用了哪个模型",
-                     font=("Microsoft YaHei UI", 11), text_color=GREY).pack(side="left", padx=8)
+                     font=FONT_S, text_color=GREY).pack(side="left", padx=8)
         ctk.CTkLabel(scroll, text="DeepSeek: 选『DeepSeek』即可(默认已填好)。"
                      "OpenAI兼容: 改 Base URL 加 /v1 并填对应模型。Claude 需另装 anthropic 库。",
-                     font=("Microsoft YaHei UI", 11), text_color=GREY,
+                     font=FONT_S, text_color=GREY,
                      anchor="w", wraplength=820, justify="left").pack(fill="x", pady=(0, 4))
 
         # ---- Telegram 告警 (可选) ----
@@ -767,8 +774,10 @@ class OKXBApp(ctk.CTk):
         self._opt_entry(scroll, "Bot Token (找 @BotFather 创建)", "TELEGRAM_BOT_TOKEN", env)
         self._opt_entry(scroll, "Chat ID (找 @userinfobot 获取)", "TELEGRAM_CHAT_ID", env, mask=False)
 
+        ctk.CTkLabel(scroll, text="保存 / 验证账户与服务", font=FONT_B, anchor="w").pack(
+            fill="x", padx=2, pady=(12, 0))
         btns = ctk.CTkFrame(scroll, fg_color="transparent")
-        btns.pack(fill="x", pady=12)
+        btns.pack(fill="x", pady=(2, 4))
         ctk.CTkButton(btns, text="💾 保存", font=FONT_B, command=self._save_credentials,
                       width=90).pack(side="left", padx=4)
         ctk.CTkButton(btns, text="🔍 验证虚拟盘", font=FONT_B, width=130, fg_color="#3a7ebf",
@@ -784,8 +793,10 @@ class OKXBApp(ctk.CTk):
         ctk.CTkButton(btns, text="🔍 验证TG", font=FONT_B, width=92, fg_color="#3a7ebf",
                       command=lambda: self._on_verify("tg")).pack(side="left", padx=4)
 
+        ctk.CTkLabel(scroll, text="验证数据源 (新闻 / 行情 / 日历)", font=FONT_B, anchor="w").pack(
+            fill="x", padx=2, pady=(8, 0))
         btns2 = ctk.CTkFrame(scroll, fg_color="transparent")
-        btns2.pack(fill="x", pady=(0, 4))
+        btns2.pack(fill="x", pady=(2, 4))
         ctk.CTkButton(btns2, text="🔍 验证加密新闻", font=FONT_B, width=140, fg_color="#3a7ebf",
                       command=lambda: self._on_verify("cryptonews")).pack(side="left", padx=4)
         ctk.CTkButton(btns2, text="🔍 验证经济日历", font=FONT_B, width=140, fg_color="#3a7ebf",
@@ -843,7 +854,7 @@ class OKXBApp(ctk.CTk):
                      "🟢PASS=统计上有净edge=可实盘 🟡PENDING=观察中=不可实盘 🔴KILL=已关闭。"
                      "现状 BTC/ETH 的 A/B/C 全 PENDING ⇒ 实盘自动【不会下任何单】(门控按预期工作)。"
                      "demo 影子=模拟盘执行验证, 非盈利; 实盘仅对 PASS 候选、且需顶部切『实盘』并确认。",
-                     font=("Microsoft YaHei UI", 11), text_color=GREY, anchor="w",
+                     font=FONT_S, text_color=GREY, anchor="w",
                      wraplength=960, justify="left").pack(fill="x", padx=12)
         asr = ctk.CTkFrame(t, fg_color="transparent"); asr.pack(fill="x", padx=8, pady=(4, 0))
         ctk.CTkLabel(asr, text="标的:", font=FONT).pack(side="left", padx=(4, 4))
@@ -851,7 +862,7 @@ class OKXBApp(ctk.CTk):
                                                        command=self._multi_asset_changed)
         self.multi_asset_seg.set("BTC"); self.multi_asset_seg.pack(side="left")
         ctk.CTkLabel(asr, text="(切换只改显示/影子/AI对照的标的; 自动交易锁定在开启时所选标的, 防误触)",
-                     font=("Microsoft YaHei UI", 11), text_color=GREY).pack(side="left", padx=8)
+                     font=FONT_S, text_color=GREY).pack(side="left", padx=8)
         self.multi_status = ctk.CTkTextbox(t, height=190, font=MONO)
         self.multi_status.pack(fill="x", padx=8, pady=(6, 2))
         self.multi_status.configure(state="disabled")
@@ -867,7 +878,7 @@ class OKXBApp(ctk.CTk):
         ctk.CTkButton(br, text="🤖 AI 解读对照", font=FONT_B, width=130, fg_color="#7a5cff",
                       command=self._multi_ai_compare).pack(side="left", padx=4)
         ctk.CTkLabel(br, text="(demo 真下单: 顶部切『虚拟盘』+ 配 demo 密钥)",
-                     font=("Microsoft YaHei UI", 11), text_color=GREY).pack(side="left", padx=6)
+                     font=FONT_S, text_color=GREY).pack(side="left", padx=6)
         # --- BTC 多周期"真实交易方向源"(按 PASS 门控的自动循环) ---
         ar = ctk.CTkFrame(t, fg_color="#241f33"); ar.pack(fill="x", padx=8, pady=(4, 2))
         self._multi_auto_on = False
@@ -877,7 +888,7 @@ class OKXBApp(ctk.CTk):
         self.multi_auto_live = ctk.CTkCheckBox(ar, text="允许实盘(仅PASS候选)", font=FONT)
         self.multi_auto_live.pack(side="left", padx=8)
         self.multi_auto_lbl = ctk.CTkLabel(ar, text="自动: 关 (每15min一轮: 刷新verdict + 按门控下单)",
-                                           font=("Microsoft YaHei UI", 11), text_color=GREY)
+                                           font=FONT_S, text_color=GREY)
         self.multi_auto_lbl.pack(side="left", padx=6)
         self.multi_result = ctk.CTkTextbox(t, font=MONO)
         self.multi_result.pack(fill="both", expand=True, padx=8, pady=(2, 8))
@@ -1062,7 +1073,7 @@ class OKXBApp(ctk.CTk):
                      font=FONT_B, anchor="w").pack(fill="x", padx=12, pady=(6, 0))
         ctk.CTkLabel(t, text="⚠ 实盘=真金, 实盘操作二次确认。做多=买, 做空=卖。手动交易无需启动引擎; "
                      "引擎『实际下单』运行时死手开关断线会撤所有挂单(正常停止先解除)。",
-                     font=("Microsoft YaHei UI", 11), text_color=AMBER, anchor="w",
+                     font=FONT_S, text_color=AMBER, anchor="w",
                      wraplength=1980, justify="left").pack(fill="x", padx=12)
 
         split = ctk.CTkFrame(t, fg_color="transparent")
@@ -1104,7 +1115,7 @@ class OKXBApp(ctk.CTk):
         ctk.CTkButton(r2, text="＋", font=FONT_B, width=30,
                       command=lambda: self._step(self.m_amt, self._amt_step())).pack(side="left", padx=1)
         self.m_amt_hint = ctk.CTkLabel(f, text="数量=USDT金额(自动换算张数); 价格仅限价/只挂单用。",
-                                       font=("Microsoft YaHei UI", 11), text_color=GREY, anchor="w")
+                                       font=FONT_S, text_color=GREY, anchor="w")
         self.m_amt_hint.pack(fill="x", padx=10)
         # 类型 + 价格
         r2b = ctk.CTkFrame(f, fg_color="transparent"); r2b.pack(fill="x", pady=3, padx=8)
@@ -1114,7 +1125,7 @@ class OKXBApp(ctk.CTk):
         ctk.CTkLabel(r2b, text="价格", font=FONT, width=42, anchor="e").pack(side="left", padx=(10, 2))
         self.m_px = ctk.CTkEntry(r2b, font=FONT, width=120); self.m_px.pack(side="left", padx=2)
         ctk.CTkLabel(f, text="只挂单(maker)=被动挂, 省费但可能不成交; 限价=按填价挂; 市价IOC=吃价即成(taker,费高)。",
-                     font=("Microsoft YaHei UI", 11), text_color=GREY, anchor="w",
+                     font=FONT_S, text_color=GREY, anchor="w",
                      wraplength=WL, justify="left").pack(fill="x", padx=10)
 
         # 止盈/止损
@@ -1141,7 +1152,7 @@ class OKXBApp(ctk.CTk):
         ctk.CTkButton(rk, text="① 建仓+止盈止损 一键套单", font=FONT_B, width=240, fg_color="#2e8b6f",
                       command=self._m_bracket).pack(side="left", padx=2)
         ctk.CTkLabel(f, text="套单=入场+止盈+止损(OCO)一次下; 成交后自动挂, 先触发者撤另一个。",
-                     font=("Microsoft YaHei UI", 11), text_color=GREY, anchor="w",
+                     font=FONT_S, text_color=GREY, anchor="w",
                      wraplength=WL, justify="left").pack(fill="x", padx=10)
 
         # 分开下单: 建仓 / 挂止盈 / 挂止损
@@ -1154,7 +1165,7 @@ class OKXBApp(ctk.CTk):
         ctk.CTkButton(rsep, text="挂止损", font=FONT_B, width=72, fg_color="#a87d32",
                       command=lambda: self._m_algo("sl")).pack(side="left", padx=2)
         ctk.CTkLabel(f, text="分开=先『建仓/加仓』, 再单独『挂止盈』『挂止损』(均按上面方向与数量, 自动只减仓)。",
-                     font=("Microsoft YaHei UI", 11), text_color=GREY, anchor="w",
+                     font=FONT_S, text_color=GREY, anchor="w",
                      wraplength=WL, justify="left").pack(fill="x", padx=10)
 
         # 减 / 平仓
@@ -1175,7 +1186,7 @@ class OKXBApp(ctk.CTk):
         self.m_live.pack(fill="x", padx=4, pady=(4, 2))
 
         ctk.CTkLabel(right, text="AI 分析 / 操作结果", font=FONT_B, anchor="w").pack(fill="x", padx=4)
-        self.m_result = ctk.CTkTextbox(right, height=210, font=MONO)
+        self.m_result = ctk.CTkTextbox(right, height=300, font=MONO)   # 容下双向研判全文, 少滚动
         self.m_result.pack(fill="x", padx=4, pady=(2, 4))
         self.m_result.insert("end", "点『AI分析此标的』在这里查看研判; 下单/平仓/撤单结果也显示在此。\n"
                              "金额默认 USDT, 自动换算张数。\n")
@@ -1186,9 +1197,9 @@ class OKXBApp(ctk.CTk):
         ctk.CTkButton(hrow, text="↻ 刷新", font=FONT, width=60,
                       command=self._refresh_orders).pack(side="left", padx=8)
         self.orders_hint = ctk.CTkLabel(hrow, text="(每5秒自动刷新; 点持仓行可带入左侧)",
-                                        font=("Microsoft YaHei UI", 11), text_color=GREY)
+                                        font=FONT_S, text_color=GREY)
         self.orders_hint.pack(side="left", padx=4)
-        self.orders_frame = ctk.CTkScrollableFrame(right, height=150)
+        self.orders_frame = ctk.CTkScrollableFrame(right, height=120)
         self.orders_frame.pack(fill="both", expand=True, padx=4, pady=(2, 2))
         self._orders_rendered = None
 
@@ -1232,11 +1243,16 @@ class OKXBApp(ctk.CTk):
         self.m_result.configure(state="disabled")
 
     def _m_run(self, fn, label: str) -> None:
-        self._m_set(f"... {label}中 ...")
+        # 操作结果(下单/平仓/撤单)是独立一行, 清空旧内容并置顶, 避免被上一条长 AI 研判淹没看不到
+        self._m_set(f"... {label}中 ...", clear=True)
 
         def work():
             r = fn()
-            self.after(0, lambda: self._m_set(r))
+
+            def done():
+                self._m_set(r, clear=True)
+                self.m_result.see("1.0")        # 结果落在顶部, 一眼看到成功/失败
+            self.after(0, done)
         threading.Thread(target=work, daemon=True).start()
 
     def _m_place(self, reduce_only: bool = False) -> None:
@@ -1331,6 +1347,7 @@ class OKXBApp(ctk.CTk):
             def done():
                 txt = res.get("text", "(无输出)")
                 self._m_set(txt, clear=True)   # 只显示当前标的研判 (历史见『📜 AI历史』)
+                self.m_result.see("1.0")       # 落在方向/入场, 不是底部免责声明
                 ai_history_append("单标的分析", inst, txt)     # 持久化, 解决"过一会找不到"
                 self._ai_last = res.get("struct")
                 if self._ai_last:
@@ -1343,7 +1360,8 @@ class OKXBApp(ctk.CTk):
         """回看最近的 AI 单标的研判 / 选品 (持久化到本机, 不会因刷新/重开而丢)。"""
         win = ctk.CTkToplevel(self)
         win.title("AI 历史 (最近 30 条)")
-        win.geometry("760x560")
+        win.geometry("820x600")
+        win.minsize(640, 480)
         win.transient(self)
         ctk.CTkLabel(win, text="AI 历史 · 最新在最上 (本机持久保存, 信息聚合非投资建议)",
                      font=FONT_B, anchor="w").pack(fill="x", padx=12, pady=(10, 4))
@@ -1730,7 +1748,9 @@ class OKXBApp(ctk.CTk):
                 if not r:
                     continue
                 lb = r["labels"]
-                lb["mid"].configure(text=f"{d['mid']:.4f}" if d.get("mid") else "-")
+                m = d.get("mid")
+                lb["mid"].configure(text=(  # 按量级取小数位: 大币2位、中价3位、小币4位 (列宽稳定)
+                    "-" if not m else f"{m:.4f}" if m < 1 else f"{m:.3f}" if m < 100 else f"{m:.2f}"))
                 lb["spread"].configure(text=f"{d['spread_bps']:.1f}" if d.get("spread_bps") is not None else "-")
                 lb["obi"].configure(text=f"{d['obi_z']:.2f}" if d.get("obi_z") is not None else "-")
                 lb["ofi"].configure(text=f"{d['ofi_z']:.2f}" if d.get("ofi_z") is not None else "-")
@@ -1739,9 +1759,11 @@ class OKXBApp(ctk.CTk):
                 lb["short"].configure(text=f"{ss:.0f}", text_color=RED if ss >= 66 else TXT)
                 tr = d.get("trad")
                 lb["trad"].configure(text=f"{tr*100:.0f}" if tr is not None else "-",
-                                     text_color=TXT if (tr is None or tr >= 0.5) else "#c08020")
+                                     text_color=TXT if (tr is None or tr >= 0.5) else LOWQ)
                 est = d.get("entry") or "-"
-                lb["entry"].configure(text=est, text_color=GREEN if est == "✓候选" else GREY)
+                ecolor = {"✓候选": GREEN, "质量低": LOWQ, "死盘": LOWQ, "价差宽": LOWQ,
+                          "方向不足": AMBER, "未确认": AMBER, "预热": AMBER}.get(est, GREY)
+                lb["entry"].configure(text=est, text_color=ecolor)
                 lb["pos"].configure(text="●" if d.get("has_pos") else "-",
                                     text_color=AMBER if d.get("has_pos") else GREY)
             self._apply_table_view(rows)
