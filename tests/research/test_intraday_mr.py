@@ -68,3 +68,13 @@ def test_verdict_pass_on_strong_forward_series():
 def test_family_trials_is_six():
     assert imr.FAMILY_TRIALS == 6
     assert imr.code_of("BTC-USDT-SWAP", "15m") == "IMR_BTC_15m"
+
+
+def test_runner_status_evaluate_without_meta(tmp_path, monkeypatch):
+    """进程内 runner: 无网络/无冻结时, status/evaluate 不崩, 给出'尚未冻结'提示 (GUI 按钮安全)。"""
+    from okxb import paths
+    from okxb.research import intraday_mr_runner as run
+    monkeypatch.setattr(paths, "APP_DIR", tmp_path)
+    assert "尚未冻结" in run.status()
+    assert "尚未冻结" in run.evaluate()
+    assert (tmp_path / "data" / "intraday_mr").exists()    # 工件目录建在 APP_DIR/data 下

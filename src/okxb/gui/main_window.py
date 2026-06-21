@@ -891,11 +891,63 @@ class OKXBApp(ctk.CTk):
                                            font=FONT_S, text_color=GREY)
         self.multi_auto_lbl.pack(side="left", padx=6)
         self.multi_result = ctk.CTkTextbox(t, font=MONO)
-        self.multi_result.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        self.multi_result.pack(fill="both", expand=True, padx=8, pady=(2, 6))
         self.multi_result.insert("end", "点『影子干运行』看 A/B/C 当前会不会触发 tau(纯公共数据, 不下单)。\n")
         self.multi_result.configure(state="disabled")
+
+        # ---- IMR · 15/30min 日内均值回归 (预登记前向研究; 只采集不实盘; 进程内, 打包 exe 也能用) ----
+        imrf = ctk.CTkFrame(t, fg_color="#1f2a24")
+        imrf.pack(fill="x", padx=8, pady=(2, 8))
+        ctk.CTkLabel(imrf, text="IMR · 15/30min 日内均值回归 (预登记前向研究 · 只采集不实盘)",
+                     font=FONT_B, anchor="w").pack(fill="x", padx=8, pady=(6, 0))
+        ctk.CTkLabel(imrf, text="BTC/ETH/SOL × {15m,30m} 共6候选; |z|>1 反向 fade, 扣15bps。"
+                     "『采集一次』累积前向样本(首次自动冻结), 攒满≥100再『评估判决』。诚实预期: 多半 PENDING/KILL。",
+                     font=FONT_S, text_color=GREY, anchor="w", wraplength=900,
+                     justify="left").pack(fill="x", padx=8)
+        ibr = ctk.CTkFrame(imrf, fg_color="transparent"); ibr.pack(fill="x", padx=8, pady=4)
+        ctk.CTkButton(ibr, text="⬇ 采集一次", font=FONT_B, width=110, fg_color="#7a5cff",
+                      command=lambda: self._imr_run("collect")).pack(side="left", padx=4)
+        ctk.CTkButton(ibr, text="⚖ 评估判决", font=FONT_B, width=110, fg_color="#3a7ebf",
+                      command=lambda: self._imr_run("evaluate")).pack(side="left", padx=4)
+        ctk.CTkButton(ibr, text="📊 查看进度", font=FONT, width=100,
+                      command=lambda: self._imr_run("status")).pack(side="left", padx=4)
+        self.imr_box = ctk.CTkTextbox(imrf, height=160, font=MONO)
+        self.imr_box.pack(fill="x", padx=8, pady=(2, 8))
+        self.imr_box.insert("end", "点『采集一次』开始累积前向数据 (公共行情免密钥; 工件存于 data/intraday_mr/)。\n"
+                            "首次会自动冻结 official_forward_start。只采集不实盘。\n")
+        self.imr_box.configure(state="disabled")
+        self._imr_busy = False
         self._multi_busy = False
         self._multi_refresh_now()
+
+    def _imr_set(self, text: str) -> None:
+        self.imr_box.configure(state="normal")
+        self.imr_box.delete("1.0", "end")
+        self.imr_box.insert("end", text + "\n")
+        self.imr_box.see("1.0")
+        self.imr_box.configure(state="disabled")
+
+    def _imr_run(self, kind: str) -> None:
+        if getattr(self, "_imr_busy", False):
+            return
+        from .controller import (imr_collect_sync, imr_evaluate_sync, imr_status_sync)
+        fn = {"collect": imr_collect_sync, "evaluate": imr_evaluate_sync,
+              "status": imr_status_sync}[kind]
+        names = {"collect": "采集", "evaluate": "评估判决", "status": "查看进度"}
+        if kind == "status":
+            self._imr_set(fn())
+            return
+        self._imr_set(f"... {names[kind]}中 (走 OKX 公共行情, 约数十秒) ...")
+        self._imr_busy = True
+
+        def work():
+            r = fn()
+
+            def done():
+                self._imr_busy = False
+                self._imr_set(r)
+            self.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
 
     def _multi_set_status(self, data: dict) -> None:
         lines = []

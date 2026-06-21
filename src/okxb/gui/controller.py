@@ -456,6 +456,28 @@ def ai_history_recent(limit: int = 30) -> list:
         return []
 
 
+# ----------------- IMR 15/30min 研究 (进程内, 供 GUI 按钮; 打包 exe 也能用) -----------------
+def imr_collect_sync() -> str:
+    from ..research import intraday_mr_runner as r
+    return _run(r.collect())
+
+
+def imr_evaluate_sync() -> str:
+    try:
+        from ..research import intraday_mr_runner as r
+        return r.evaluate()
+    except Exception as e:
+        return f"IMR 评估失败: {e!r}"
+
+
+def imr_status_sync() -> str:
+    try:
+        from ..research import intraday_mr_runner as r
+        return r.status()
+    except Exception as e:
+        return f"IMR 状态读取失败: {e!r}"
+
+
 async def _get_spec(rest, inst_id):
     from ..exchange.okx_rest import OkxError
     try:

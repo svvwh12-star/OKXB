@@ -28,19 +28,26 @@ fade，净值多半为负 → KILL/PENDING。
 - **Sticky KILL**：连温和成本（10bps）下、样本 ≥30 仍 `net10 ≤ 0` → 判死，**永不复活**为 PENDING/PASS。
 
 ## 不可变性 / 防作弊
+工件统一写到 **`data/intraday_mr/`**（开发态=项目根 `data/`，打包态=`OKXB.exe` 同级 `data/`，均已被
+.gitignore 忽略）：
 - 冻结写 `frozen/meta.json`（含 `official_forward_start_ts_ms` + 各候选训练期基准），并由
   `forward_integrity.write_manifest` 出 `MANIFEST.json`（改 meta 即断 manifest = 预登记作废）。
-- 前向样本进**行级哈希链** `data/forward_append_only/imr_ledger_hashchain.csv`（改任一历史行即断链）。
+- 前向样本进**行级哈希链** `imr_ledger_hashchain.csv`（改任一历史行即断链）。
 - 死亡标记 `frozen/{code}/DEAD.json`（sticky）。
 
-## 运行（开发态，公共行情免密钥）
+## 运行方式
+**① 在 exe 里点按钮（推荐，打包态也能用）**：`多周期研究` 页底部 **IMR · 15/30min** 区
+→ 『⬇ 采集一次』/『⚖ 评估判决』/『📊 查看进度』。进程内执行，无需 python。
+
+**② 命令行 / 计划任务（开发态，公共行情免密钥）**：
 ```
 cd intraday_mr_research/scripts
 python run_intraday_mr.py --mode collect    # 抓最新bar→追加前向标签（首次自动冻结）
 python run_intraday_mr.py --mode evaluate   # 判决
 python run_intraday_mr.py --mode status     # 看进度（各候选 已采集/100）
 ```
-已接入 `btc_single_asset_research/scripts/accrue_forward.ps1`，随 4 小时计划任务一并 collect+evaluate。
+①②**同一套代码、同一数据目录**（`okxb.research.intraday_mr_runner`）。已接入
+`btc_single_asset_research/scripts/accrue_forward.ps1`，随 4 小时计划任务一并 collect+evaluate。
 
 ## 诚实的时间表与结论
 - 15m：~100 个独立前向 ts 需**数天到数周**活跃采集；30m 约**翻倍**。
